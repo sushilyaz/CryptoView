@@ -1,0 +1,30 @@
+spring:
+  application:
+    name: CryptoView-Test
+
+cryptoview:
+  telegram:
+    enabled: false
+  global:
+    min-density-usd: 100000
+    cooldown-minutes: 5
+    max-distance-percent: 10.0
+    enabled: false
+
+  exchanges:
+    BINANCE:
+      enabled: false
+    BYBIT:
+      enabled: false
+    OKX:
+      enabled: false
+    BITGET:
+      enabled: false
+    GATE:
+      enabled: false
+    MEXC:
+      enabled: false
+    HYPERLIQUID:
+      enabled: false
+    LIGHTER:
+      enabled: false

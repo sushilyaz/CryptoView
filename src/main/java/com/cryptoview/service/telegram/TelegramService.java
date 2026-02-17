@@ -1,0 +1,179 @@
+package com.cryptoview.service.telegram;
+
+import com.cryptoview.config.CryptoViewProperties;
+import com.cryptoview.event.AlertEvent;
+import com.cryptoview.model.domain.Alert;
+import com.cryptoview.model.enums.AlertType;
+import com.cryptoview.model.enums.Side;
+import jakarta.annotation.PostConstruct;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import okhttp3.*;
+import org.springframework.context.event.EventListener;
+import org.springframework.scheduling.annotation.Async;
+import org.springframework.stereotype.Service;
+
+import java.io.IOException;
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.text.NumberFormat;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
+import java.util.Locale;
+
+@Slf4j
+@Service
+@RequiredArgsConstructor
+public class TelegramService {
+
+    private final CryptoViewProperties properties;
+    private final OkHttpClient httpClient;
+
+    private static final String TELEGRAM_API_URL = "https://api.telegram.org/bot%s/sendMessage";
+    private static final MediaType JSON = MediaType.get("application/json; charset=utf-8");
+    private static final DateTimeFormatter TIME_FORMATTER = DateTimeFormatter
+            .ofPattern("HH:mm:ss")
+            .withZone(ZoneId.of("UTC"));
+    private static final NumberFormat CURRENCY_FORMAT = NumberFormat.getNumberInstance(Locale.US);
+
+    @PostConstruct
+    public void init() {
+        if (properties.getTelegram().isEnabled() && properties.getTelegram().getBotToken() != null) {
+            log.info("Telegram notifications enabled");
+        } else {
+            log.warn("Telegram notifications disabled or not configured");
+        }
+    }
+
+    @EventListener
+    @Async
+    public void onAlert(AlertEvent event) {
+        if (!properties.getTelegram().isEnabled()) {
+            return;
+        }
+
+        Alert alert = event.getAlert();
+        String message = formatAlertMessage(alert);
+
+        for (String chatId : properties.getTelegram().getChatIds()) {
+            sendMessage(chatId, message);
+        }
+    }
+
+    private String formatAlertMessage(Alert alert) {
+        StringBuilder sb = new StringBuilder();
+
+        // Эмодзи в зависимости от стороны
+        String emoji = alert.side() == Side.BID ? "🟢" : "🔴";
+
+        sb.append(emoji).append(" *АНОМАЛЬНАЯ ПЛОТНОСТЬ*\n\n");
+
+        // Символ и биржа
+        sb.append("📊 *").append(formatSymbol(alert.symbol())).append("* | ");
+        sb.append(alert.exchange().getDisplayName()).append(" ");
+        sb.append(alert.marketType().getDisplayName()).append("\n");
+
+        // Тип алерта
+        sb.append("📈 Тип: ").append(formatAlertType(alert.alertType())).append("\n\n");
+
+        // Объём
+        sb.append("💰 Объём: *$").append(formatCurrency(alert.volumeUsd())).append("*\n");
+
+        // Цена и сторона
+        sb.append("📍 Цена: ").append(formatPrice(alert.price()));
+        sb.append(" (").append(alert.side().getDisplayName()).append(")\n");
+
+        // Расстояние от рынка
+        String distanceSign = alert.distancePercent().compareTo(BigDecimal.ZERO) >= 0 ? "+" : "";
+        sb.append("📏 От рынка: ").append(distanceSign);
+        sb.append(alert.distancePercent().setScale(2, RoundingMode.HALF_UP)).append("%\n\n");
+
+        // Объём за 15 минут
+        if (alert.volume15min() != null && alert.volume15min().compareTo(BigDecimal.ZERO) > 0) {
+            sb.append("📊 Объём 15м: $").append(formatCurrency(alert.volume15min())).append("\n");
+        }
+
+        // Время
+        sb.append("⏱ Время: ").append(TIME_FORMATTER.format(alert.timestamp())).append(" UTC\n");
+
+        // Комментарий
+        if (alert.comment() != null && !alert.comment().isBlank()) {
+            sb.append("\n💬 _").append(escapeMarkdown(alert.comment())).append("_");
+        }
+
+        return sb.toString();
+    }
+
+    private String formatSymbol(String symbol) {
+        // BTCUSDT -> BTC/USDT
+        if (symbol.endsWith("USDT")) {
+            return symbol.replace("USDT", "/USDT");
+        } else if (symbol.endsWith("USDC")) {
+            return symbol.replace("USDC", "/USDC");
+        }
+        return symbol;
+    }
+
+    private String formatAlertType(AlertType type) {
+        return switch (type) {
+            case VOLUME_BASED -> "По объёму 15м";
+            case STATISTICAL -> "Статистический";
+        };
+    }
+
+    private String formatCurrency(BigDecimal value) {
+        return CURRENCY_FORMAT.format(value.setScale(0, RoundingMode.HALF_UP));
+    }
+
+    private String formatPrice(BigDecimal price) {
+        if (price.compareTo(new BigDecimal("1")) < 0) {
+            return price.toPlainString();
+        } else if (price.compareTo(new BigDecimal("100")) < 0) {
+            return price.setScale(4, RoundingMode.HALF_UP).toPlainString();
+        } else {
+            return price.setScale(2, RoundingMode.HALF_UP).toPlainString();
+        }
+    }
+
+    private String escapeMarkdown(String text) {
+        return text
+                .replace("_", "\\_")
+                .replace("*", "\\*")
+                .replace("[", "\\[")
+                .replace("`", "\\`");
+    }
+
+    private void sendMessage(String chatId, String text) {
+        String url = String.format(TELEGRAM_API_URL, properties.getTelegram().getBotToken());
+
+        String json = String.format(
+                "{\"chat_id\":\"%s\",\"text\":\"%s\",\"parse_mode\":\"Markdown\",\"disable_web_page_preview\":true}",
+                chatId,
+                escapeJson(text)
+        );
+
+        Request request = new Request.Builder()
+                .url(url)
+                .post(RequestBody.create(json, JSON))
+                .build();
+
+        try (Response response = httpClient.newCall(request).execute()) {
+            if (!response.isSuccessful()) {
+                log.error("Failed to send Telegram message: {} - {}",
+                        response.code(),
+                        response.body() != null ? response.body().string() : "no body");
+            }
+        } catch (IOException e) {
+            log.error("Error sending Telegram message", e);
+        }
+    }
+
+    private String escapeJson(String text) {
+        return text
+                .replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("\n", "\\n")
+                .replace("\r", "\\r")
+                .replace("\t", "\\t");
+    }
+}

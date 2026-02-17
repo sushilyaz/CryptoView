@@ -1,0 +1,95 @@
+spring:
+  application:
+    name: CryptoView
+  main:
+    banner-mode: off
+
+server:
+  port: 8080
+
+# Logging configured in logback-spring.xml
+
+# CryptoView Configuration
+cryptoview:
+  telegram:
+    bot-token: ${TELEGRAM_BOT_TOKEN:}
+    chat-ids:
+      - ${TELEGRAM_CHAT_ID:}
+    enabled: ${TELEGRAM_ENABLED:false}
+
+  global:
+    min-density-usd: 100000
+    cooldown-minutes: 5
+    max-distance-percent: 10.0
+    alert-types:
+      - VOLUME_BASED
+      - STATISTICAL
+    enabled: true
+
+  exchanges:
+    BINANCE:
+      enabled: true
+      spot:
+        enabled: true
+        min-density-usd: 600000
+      futures:
+        enabled: true
+        min-density-usd: 600000
+
+    BYBIT:
+      enabled: true
+      spot:
+        enabled: true
+        min-density-usd: 500000
+      futures:
+        enabled: true
+        min-density-usd: 500000
+
+    OKX:
+      enabled: true
+      spot:
+        enabled: true
+        min-density-usd: 400000
+      futures:
+        enabled: true
+        min-density-usd: 400000
+
+    BITGET:
+      enabled: true
+      spot:
+        enabled: true
+        min-density-usd: 400000
+      futures:
+        enabled: true
+        min-density-usd: 400000
+
+    GATE:
+      enabled: false
+      spot:
+        enabled: false
+        min-density-usd: 400000
+      futures:
+        enabled: false
+        min-density-usd: 400000
+
+    MEXC:
+      enabled: true
+      spot:
+        enabled: true
+        min-density-usd: 400000
+      # MEXC Futures отключен по требованию
+      futures:
+        enabled: false
+
+    HYPERLIQUID:
+      enabled: true
+      # Hyperliquid работает только как futures (perpetual DEX)
+      futures:
+        enabled: true
+        min-density-usd: 400000
+
+    LIGHTER:
+      enabled: false
+      spot:
+        enabled: false
+        min-density-usd: 400000
