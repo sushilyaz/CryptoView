@@ -46,27 +46,20 @@ public class VolumeTracker {
     }
 
     /**
-     * Засеивает исторический объём за 15 минут, распределяя по минутным бакетам.
-     * Данные будут постепенно expire, имитируя скользящее окно.
+     * Возвращает сколько секунд мы трекаем данные для символа.
+     * 0 — если данных нет.
      */
-    public void seedVolume(String symbol, Exchange exchange, MarketType marketType, BigDecimal totalVolumeUsd) {
-        if (totalVolumeUsd == null || totalVolumeUsd.compareTo(BigDecimal.ZERO) <= 0) {
-            return;
-        }
-
+    public long getTrackingAgeSec(String symbol, Exchange exchange, MarketType marketType) {
         String key = buildKey(symbol, exchange, marketType);
-        Queue<VolumeEntry> queue = volumeHistory.computeIfAbsent(key, k -> new ConcurrentLinkedQueue<>());
-
-        // Распределяем объём по 15 минутным бакетам
-        BigDecimal perMinute = totalVolumeUsd.divide(BigDecimal.valueOf(WINDOW_MINUTES), 2, java.math.RoundingMode.HALF_UP);
-        Instant now = Instant.now();
-
-        for (int i = WINDOW_MINUTES - 1; i >= 0; i--) {
-            Instant timestamp = now.minus(i, ChronoUnit.MINUTES);
-            queue.add(new VolumeEntry(perMinute, timestamp));
+        Queue<VolumeEntry> history = volumeHistory.get(key);
+        if (history == null || history.isEmpty()) {
+            return 0;
         }
-
-        log.info("[{}:{}] Seeded volume for {}: {} USD", exchange, marketType, symbol, totalVolumeUsd);
+        VolumeEntry oldest = history.peek();
+        if (oldest == null) {
+            return 0;
+        }
+        return java.time.Duration.between(oldest.timestamp(), Instant.now()).toSeconds();
     }
 
     public BigDecimal getVolume15Min(String symbol, Exchange exchange, MarketType marketType) {

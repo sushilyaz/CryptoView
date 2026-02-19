@@ -58,8 +58,6 @@ public class BybitFuturesConnector extends AbstractWebSocketConnector {
     public void subscribeAll() {
         List<String> symbols = fetchAllSymbols();
         if (!symbols.isEmpty()) {
-            preloadVolumes(symbols);
-
             if (!connectAndWait(5000)) {
                 log.error("[BYBIT:FUTURES] Failed to connect WebSocket, aborting subscribe");
                 return;
@@ -80,40 +78,6 @@ public class BybitFuturesConnector extends AbstractWebSocketConnector {
             }
             log.info("[BYBIT:FUTURES] Subscribed to {} symbols", symbols.size());
         }
-    }
-
-    @Override
-    protected void preloadVolumes(List<String> symbols) {
-        log.info("[BYBIT:FUTURES] Pre-loading volumes for {} symbols...", symbols.size());
-        int loaded = 0;
-        for (int i = 0; i < symbols.size(); i += 5) {
-            int end = Math.min(i + 5, symbols.size());
-            for (int j = i; j < end; j++) {
-                String symbol = symbols.get(j);
-                try {
-                    String url = "https://api.bybit.com/v5/market/kline?category=linear&symbol=" + symbol + "&interval=1&limit=15";
-                    Request request = new Request.Builder().url(url).build();
-                    try (Response response = httpClient.newCall(request).execute()) {
-                        if (response.isSuccessful() && response.body() != null) {
-                            JsonNode root = objectMapper.readTree(response.body().string());
-                            JsonNode list = root.path("result").path("list");
-                            BigDecimal totalVolume = BigDecimal.ZERO;
-                            if (list != null && list.isArray()) {
-                                for (JsonNode kline : list) {
-                                    totalVolume = totalVolume.add(new BigDecimal(kline.get(6).asText())); // turnover
-                                }
-                            }
-                            volumeTracker.seedVolume(symbol, Exchange.BYBIT, MarketType.FUTURES, totalVolume);
-                            loaded++;
-                        }
-                    }
-                } catch (Exception e) {
-                    log.debug("[BYBIT:FUTURES] Failed to preload volume for {}: {}", symbol, e.getMessage());
-                }
-            }
-            try { Thread.sleep(500); } catch (InterruptedException e) { Thread.currentThread().interrupt(); break; }
-        }
-        log.info("[BYBIT:FUTURES] Pre-loaded volume for {}/{} symbols", loaded, symbols.size());
     }
 
     private List<String> fetchAllSymbols() {

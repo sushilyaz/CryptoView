@@ -20,11 +20,9 @@ import org.springframework.stereotype.Service;
 import java.math.BigDecimal;
 import java.math.RoundingMode;
 import java.time.Instant;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.EnumSet;
 
 @Slf4j
 @Service
@@ -37,6 +35,7 @@ public class AnomalyDetector {
 
     private static final double Z_SCORE_THRESHOLD = 3.0;
     private static final double IQR_MULTIPLIER = 3.0;
+    private static final long MIN_VOLUME_TRACKING_SEC = 300; // 5 минут минимум для VOLUME_BASED
 
     // Дедупликация: ключ -> время последнего алерта
     private final Map<String, Instant> recentAlerts = new ConcurrentHashMap<>();
@@ -70,6 +69,23 @@ public class AnomalyDetector {
                 orderBook.marketType()
         );
 
+        // VOLUME_BASED доступен только если собрано >= 5 минут данных
+        long trackingAge = volumeTracker.getTrackingAgeSec(
+                orderBook.symbol(), orderBook.exchange(), orderBook.marketType());
+        boolean volumeBasedReady = trackingAge >= MIN_VOLUME_TRACKING_SEC;
+
+        Set<AlertType> activeAlertTypes = EnumSet.noneOf(AlertType.class);
+        if (alertTypes.contains(AlertType.STATISTICAL)) {
+            activeAlertTypes.add(AlertType.STATISTICAL);
+        }
+        if (alertTypes.contains(AlertType.VOLUME_BASED) && volumeBasedReady) {
+            activeAlertTypes.add(AlertType.VOLUME_BASED);
+        }
+
+        if (activeAlertTypes.isEmpty()) {
+            return;
+        }
+
         // Собираем все уровни для статистического анализа
         List<BigDecimal> allVolumes = new ArrayList<>();
         for (OrderBookLevel level : orderBook.bids()) {
@@ -81,21 +97,40 @@ public class AnomalyDetector {
 
         StatisticalThresholds thresholds = calculateThresholds(allVolumes);
 
+        // Собираем лучших кандидатов для каждой комбинации side+alertType
+        Map<String, Density> bestCandidates = new HashMap<>();
+
         // Анализируем bids
         for (OrderBookLevel level : orderBook.bids()) {
-            analyzeLevel(orderBook, level, Side.BID, config, alertTypes, minDensityUsd, volume15min, thresholds);
+            collectCandidates(orderBook, level, Side.BID, activeAlertTypes, minDensityUsd, volume15min, thresholds, bestCandidates);
         }
 
         // Анализируем asks
         for (OrderBookLevel level : orderBook.asks()) {
-            analyzeLevel(orderBook, level, Side.ASK, config, alertTypes, minDensityUsd, volume15min, thresholds);
+            collectCandidates(orderBook, level, Side.ASK, activeAlertTypes, minDensityUsd, volume15min, thresholds, bestCandidates);
+        }
+
+        // Публикуем только лучших кандидатов (1 алерт на side+alertType)
+        int cooldownMinutes = config.getCooldownMinutes();
+        for (Map.Entry<String, Density> entry : bestCandidates.entrySet()) {
+            String candidateKey = entry.getKey(); // "BID_VOLUME_BASED"
+            Density density = entry.getValue();
+            AlertType alertType = candidateKey.endsWith("_VOLUME_BASED") ? AlertType.VOLUME_BASED : AlertType.STATISTICAL;
+
+            if (!isDuplicate(density, alertType, cooldownMinutes)) {
+                log.info("[{}:{}] {} density: {} {} @ {} | vol=${}",
+                        orderBook.exchange(), orderBook.marketType(),
+                        alertType, orderBook.symbol(), density.side(), density.price(), density.volumeUsd());
+                eventPublisher.publishEvent(new DensityDetectedEvent(this, density, alertType, volume15min));
+                markAsAlerted(density, alertType);
+            }
         }
     }
 
-    private void analyzeLevel(OrderBook orderBook, OrderBookLevel level, Side side,
-                               EffectiveConfig config, Set<AlertType> alertTypes,
-                               BigDecimal minDensityUsd, BigDecimal volume15min,
-                               StatisticalThresholds thresholds) {
+    private void collectCandidates(OrderBook orderBook, OrderBookLevel level, Side side,
+                                    Set<AlertType> alertTypes, BigDecimal minDensityUsd,
+                                    BigDecimal volume15min, StatisticalThresholds thresholds,
+                                    Map<String, Density> bestCandidates) {
         BigDecimal volumeUsd = level.getVolumeUsd();
 
         // Проверяем минимальный порог
@@ -120,12 +155,10 @@ public class AnomalyDetector {
         // Проверяем VOLUME_BASED
         if (alertTypes.contains(AlertType.VOLUME_BASED)) {
             if (volume15min.compareTo(BigDecimal.ZERO) > 0 && volumeUsd.compareTo(volume15min) > 0) {
-                if (!isDuplicate(density, AlertType.VOLUME_BASED, config.getCooldownMinutes())) {
-                    log.info("[{}:{}] VOLUME_BASED density: {} {} @ {} | vol={} > vol15m={}",
-                            orderBook.exchange(), orderBook.marketType(),
-                            orderBook.symbol(), side, level.price(), volumeUsd, volume15min);
-                    eventPublisher.publishEvent(new DensityDetectedEvent(this, density, AlertType.VOLUME_BASED, volume15min));
-                    markAsAlerted(density, AlertType.VOLUME_BASED);
+                String key = side + "_VOLUME_BASED";
+                Density current = bestCandidates.get(key);
+                if (current == null || volumeUsd.compareTo(current.volumeUsd()) > 0) {
+                    bestCandidates.put(key, density);
                 }
             }
         }
@@ -133,12 +166,10 @@ public class AnomalyDetector {
         // Проверяем STATISTICAL
         if (alertTypes.contains(AlertType.STATISTICAL)) {
             if (isStatisticalAnomaly(volumeUsd, thresholds)) {
-                if (!isDuplicate(density, AlertType.STATISTICAL, config.getCooldownMinutes())) {
-                    log.info("[{}:{}] STATISTICAL density: {} {} @ {} | vol={} > threshold={}",
-                            orderBook.exchange(), orderBook.marketType(),
-                            orderBook.symbol(), side, level.price(), volumeUsd, thresholds.threshold());
-                    eventPublisher.publishEvent(new DensityDetectedEvent(this, density, AlertType.STATISTICAL, volume15min));
-                    markAsAlerted(density, AlertType.STATISTICAL);
+                String key = side + "_STATISTICAL";
+                Density current = bestCandidates.get(key);
+                if (current == null || volumeUsd.compareTo(current.volumeUsd()) > 0) {
+                    bestCandidates.put(key, density);
                 }
             }
         }
@@ -189,8 +220,14 @@ public class AnomalyDetector {
                 .multiply(new BigDecimal("100"));
     }
 
+    private String deduplicationKey(Density density, AlertType alertType) {
+        // Группируем по символу+бирже+рынку+стороне (без price), чтобы не спамить на каждый уровень
+        return String.format("%s_%s_%s_%s_%s",
+                density.exchange(), density.marketType(), density.symbol(), density.side(), alertType);
+    }
+
     private boolean isDuplicate(Density density, AlertType alertType, int cooldownMinutes) {
-        String key = density.getUniqueKey() + "_" + alertType;
+        String key = deduplicationKey(density, alertType);
         Instant lastAlert = recentAlerts.get(key);
 
         if (lastAlert == null) {
@@ -201,7 +238,7 @@ public class AnomalyDetector {
     }
 
     private void markAsAlerted(Density density, AlertType alertType) {
-        String key = density.getUniqueKey() + "_" + alertType;
+        String key = deduplicationKey(density, alertType);
         recentAlerts.put(key, Instant.now());
     }
 

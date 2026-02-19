@@ -6,6 +6,7 @@ import com.cryptoview.model.domain.Alert;
 import com.cryptoview.model.enums.AlertType;
 import com.cryptoview.model.enums.Side;
 import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import okhttp3.*;
@@ -20,6 +21,8 @@ import java.text.NumberFormat;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
 import java.util.Locale;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
 
 @Slf4j
 @Service
@@ -36,12 +39,33 @@ public class TelegramService {
             .withZone(ZoneId.of("UTC"));
     private static final NumberFormat CURRENCY_FORMAT = NumberFormat.getNumberInstance(Locale.US);
 
+    private static final int MAX_QUEUE_SIZE = 500;
+    private static final long SEND_INTERVAL_MS = 50; // ~20 msg/sec — безопасно для Telegram API
+    private static final int MAX_RETRY = 3;
+
+    private final LinkedBlockingQueue<TelegramMessage> messageQueue = new LinkedBlockingQueue<>(MAX_QUEUE_SIZE);
+    private volatile boolean running = true;
+    private Thread senderThread;
+
+    private record TelegramMessage(String chatId, String text) {}
+
     @PostConstruct
     public void init() {
         if (properties.getTelegram().isEnabled() && properties.getTelegram().getBotToken() != null) {
             log.info("Telegram notifications enabled");
+            senderThread = new Thread(this::senderLoop, "telegram-sender");
+            senderThread.setDaemon(true);
+            senderThread.start();
         } else {
             log.warn("Telegram notifications disabled or not configured");
+        }
+    }
+
+    @PreDestroy
+    public void shutdown() {
+        running = false;
+        if (senderThread != null) {
+            senderThread.interrupt();
         }
     }
 
@@ -56,8 +80,27 @@ public class TelegramService {
         String message = formatAlertMessage(alert);
 
         for (String chatId : properties.getTelegram().getChatIds()) {
-            sendMessage(chatId, message);
+            if (!messageQueue.offer(new TelegramMessage(chatId, message))) {
+                log.warn("Telegram message queue full, dropping alert for {}", alert.symbol());
+            }
         }
+    }
+
+    private void senderLoop() {
+        log.info("Telegram sender thread started");
+        while (running) {
+            try {
+                TelegramMessage msg = messageQueue.poll(1, TimeUnit.SECONDS);
+                if (msg != null) {
+                    sendWithRetry(msg.chatId(), msg.text());
+                    Thread.sleep(SEND_INTERVAL_MS);
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            }
+        }
+        log.info("Telegram sender thread stopped, {} messages in queue", messageQueue.size());
     }
 
     private String formatAlertMessage(Alert alert) {
@@ -143,7 +186,7 @@ public class TelegramService {
                 .replace("`", "\\`");
     }
 
-    private void sendMessage(String chatId, String text) {
+    private void sendWithRetry(String chatId, String text) {
         String url = String.format(TELEGRAM_API_URL, properties.getTelegram().getBotToken());
 
         String json = String.format(
@@ -157,14 +200,41 @@ public class TelegramService {
                 .post(RequestBody.create(json, JSON))
                 .build();
 
-        try (Response response = httpClient.newCall(request).execute()) {
-            if (!response.isSuccessful()) {
+        for (int attempt = 1; attempt <= MAX_RETRY; attempt++) {
+            try (Response response = httpClient.newCall(request).execute()) {
+                if (response.isSuccessful()) {
+                    return;
+                }
+                if (response.code() == 429) {
+                    // Rate limited — read retry_after from response
+                    long retryAfterMs = 1000L * attempt;
+                    String body = response.body() != null ? response.body().string() : "";
+                    try {
+                        var node = new com.fasterxml.jackson.databind.ObjectMapper().readTree(body);
+                        if (node.has("parameters") && node.get("parameters").has("retry_after")) {
+                            retryAfterMs = node.get("parameters").get("retry_after").asLong() * 1000L;
+                        }
+                    } catch (Exception ignored) {}
+                    log.warn("Telegram rate limited (429), retry in {}ms (attempt {}/{})", retryAfterMs, attempt, MAX_RETRY);
+                    Thread.sleep(retryAfterMs);
+                    continue;
+                }
                 log.error("Failed to send Telegram message: {} - {}",
                         response.code(),
                         response.body() != null ? response.body().string() : "no body");
+                return;
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return;
+            } catch (IOException e) {
+                log.error("Error sending Telegram message (attempt {}/{})", attempt, MAX_RETRY, e);
+                if (attempt < MAX_RETRY) {
+                    try { Thread.sleep(1000L * attempt); } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                }
             }
-        } catch (IOException e) {
-            log.error("Error sending Telegram message", e);
         }
     }
 

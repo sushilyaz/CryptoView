@@ -20,11 +20,12 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Collectors;
 
+
 @Slf4j
 @Component
 public class BinanceFuturesConnector extends AbstractWebSocketConnector {
 
-    private static final String WS_URL = "wss://fstream.binance.com/ws";
+    private static final String WS_URL = "wss://fstream.binance.com/stream";
     private static final String REST_URL = "https://fapi.binance.com/fapi/v1/exchangeInfo";
 
     public BinanceFuturesConnector(OkHttpClient httpClient,
@@ -58,7 +59,13 @@ public class BinanceFuturesConnector extends AbstractWebSocketConnector {
     public void subscribeAll() {
         List<String> symbols = fetchAllSymbols();
         if (!symbols.isEmpty()) {
-            preloadVolumes(symbols);
+            // Binance limit: 1024 streams per connection. Each symbol = 2 streams (depth + aggTrade)
+            int maxSymbols = 512;
+            if (symbols.size() > maxSymbols) {
+                log.warn("[BINANCE:FUTURES] Limiting from {} to {} symbols (1024 stream limit)",
+                        symbols.size(), maxSymbols);
+                symbols = symbols.subList(0, maxSymbols);
+            }
 
             if (!connectAndWait(5000)) {
                 log.error("[BINANCE:FUTURES] Failed to connect WebSocket, aborting subscribe");
@@ -80,37 +87,6 @@ public class BinanceFuturesConnector extends AbstractWebSocketConnector {
             }
             log.info("[BINANCE:FUTURES] Subscribed to {} symbols", symbols.size());
         }
-    }
-
-    @Override
-    protected void preloadVolumes(List<String> symbols) {
-        log.info("[BINANCE:FUTURES] Pre-loading volumes for {} symbols...", symbols.size());
-        int loaded = 0;
-        for (int i = 0; i < symbols.size(); i += 5) {
-            int end = Math.min(i + 5, symbols.size());
-            List<String> batch = symbols.subList(i, end);
-            for (String symbol : batch) {
-                try {
-                    String url = "https://fapi.binance.com/fapi/v1/klines?symbol=" + symbol + "&interval=1m&limit=15";
-                    Request request = new Request.Builder().url(url).build();
-                    try (Response response = httpClient.newCall(request).execute()) {
-                        if (response.isSuccessful() && response.body() != null) {
-                            JsonNode klines = objectMapper.readTree(response.body().string());
-                            BigDecimal totalVolume = BigDecimal.ZERO;
-                            for (JsonNode kline : klines) {
-                                totalVolume = totalVolume.add(new BigDecimal(kline.get(7).asText()));
-                            }
-                            volumeTracker.seedVolume(symbol, Exchange.BINANCE, MarketType.FUTURES, totalVolume);
-                            loaded++;
-                        }
-                    }
-                } catch (Exception e) {
-                    log.debug("[BINANCE:FUTURES] Failed to preload volume for {}: {}", symbol, e.getMessage());
-                }
-            }
-            try { Thread.sleep(500); } catch (InterruptedException e) { Thread.currentThread().interrupt(); break; }
-        }
-        log.info("[BINANCE:FUTURES] Pre-loaded volume for {}/{} symbols", loaded, symbols.size());
     }
 
     private List<String> fetchAllSymbols() {
@@ -154,40 +130,29 @@ public class BinanceFuturesConnector extends AbstractWebSocketConnector {
             return;
         }
 
-        // Depth subscription
-        List<String> depthStreams = symbols.stream()
-                .map(s -> s.toLowerCase() + "@depth20@100ms")
-                .collect(Collectors.toList());
-        String depthMsg = String.format("{\"method\":\"SUBSCRIBE\",\"params\":%s,\"id\":%d}",
-                toJsonArray(depthStreams), System.currentTimeMillis());
-        webSocket.send(depthMsg);
-
-        try {
-            Thread.sleep(100);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+        // Combined depth + trade subscription in one message
+        List<String> allStreams = new ArrayList<>();
+        for (String s : symbols) {
+            allStreams.add(s.toLowerCase() + "@depth20@500ms");
+            allStreams.add(s.toLowerCase() + "@aggTrade");
         }
-
-        // AggTrade subscription
-        List<String> tradeStreams = symbols.stream()
-                .map(s -> s.toLowerCase() + "@aggTrade")
-                .collect(Collectors.toList());
-        String tradeMsg = String.format("{\"method\":\"SUBSCRIBE\",\"params\":%s,\"id\":%d}",
-                toJsonArray(tradeStreams), System.currentTimeMillis());
-        webSocket.send(tradeMsg);
+        String msg = String.format("{\"method\":\"SUBSCRIBE\",\"params\":%s,\"id\":%d}",
+                toJsonArray(allStreams), System.currentTimeMillis());
+        webSocket.send(msg);
 
         subscribedSymbols.addAll(symbols);
-        log.debug("[BINANCE:FUTURES] Subscribed to {} symbols", symbols.size());
+        log.debug("[BINANCE:FUTURES] Subscribed to {} symbols ({} streams)", symbols.size(), allStreams.size());
     }
 
     @Override
     protected String buildSubscribeMessage(List<String> symbols) {
-        // Not used directly - subscribe() is overridden
-        List<String> streams = symbols.stream()
-                .map(s -> s.toLowerCase() + "@depth20@100ms")
-                .collect(Collectors.toList());
+        List<String> allStreams = new ArrayList<>();
+        for (String s : symbols) {
+            allStreams.add(s.toLowerCase() + "@depth20@500ms");
+            allStreams.add(s.toLowerCase() + "@aggTrade");
+        }
         return String.format("{\"method\":\"SUBSCRIBE\",\"params\":%s,\"id\":%d}",
-                toJsonArray(streams), System.currentTimeMillis());
+                toJsonArray(allStreams), System.currentTimeMillis());
     }
 
     private String toJsonArray(List<String> items) {

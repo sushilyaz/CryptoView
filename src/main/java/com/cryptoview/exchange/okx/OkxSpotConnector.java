@@ -58,21 +58,19 @@ public class OkxSpotConnector extends AbstractWebSocketConnector {
     public void subscribeAll() {
         List<String> symbols = fetchAllSymbols();
         if (!symbols.isEmpty()) {
-            preloadVolumes(symbols);
-
             if (!connectAndWait(5000)) {
                 log.error("[OKX:SPOT] Failed to connect WebSocket, aborting subscribe");
                 return;
             }
 
-            int batchSize = 100;
+            int batchSize = 50;
             for (int i = 0; i < symbols.size(); i += batchSize) {
                 int end = Math.min(i + batchSize, symbols.size());
                 List<String> batch = symbols.subList(i, end);
                 subscribe(batch);
 
                 try {
-                    Thread.sleep(100);
+                    Thread.sleep(300);
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     break;
@@ -80,41 +78,6 @@ public class OkxSpotConnector extends AbstractWebSocketConnector {
             }
             log.info("[OKX:SPOT] Subscribed to {} symbols", symbols.size());
         }
-    }
-
-    @Override
-    protected void preloadVolumes(List<String> symbols) {
-        log.info("[OKX:SPOT] Pre-loading volumes for {} symbols...", symbols.size());
-        int loaded = 0;
-        for (int i = 0; i < symbols.size(); i += 5) {
-            int end = Math.min(i + 5, symbols.size());
-            for (int j = i; j < end; j++) {
-                String instId = symbols.get(j);
-                String symbol = instId.replace("-", "");
-                try {
-                    String url = "https://www.okx.com/api/v5/market/candles?instId=" + instId + "&bar=1m&limit=15";
-                    Request request = new Request.Builder().url(url).build();
-                    try (Response response = httpClient.newCall(request).execute()) {
-                        if (response.isSuccessful() && response.body() != null) {
-                            JsonNode root = objectMapper.readTree(response.body().string());
-                            JsonNode data = root.get("data");
-                            BigDecimal totalVolume = BigDecimal.ZERO;
-                            if (data != null && data.isArray()) {
-                                for (JsonNode kline : data) {
-                                    totalVolume = totalVolume.add(new BigDecimal(kline.get(7).asText())); // volCcyQuote
-                                }
-                            }
-                            volumeTracker.seedVolume(symbol, Exchange.OKX, MarketType.SPOT, totalVolume);
-                            loaded++;
-                        }
-                    }
-                } catch (Exception e) {
-                    log.debug("[OKX:SPOT] Failed to preload volume for {}: {}", instId, e.getMessage());
-                }
-            }
-            try { Thread.sleep(500); } catch (InterruptedException e) { Thread.currentThread().interrupt(); break; }
-        }
-        log.info("[OKX:SPOT] Pre-loaded volume for {}/{} symbols", loaded, symbols.size());
     }
 
     private List<String> fetchAllSymbols() {
@@ -151,16 +114,35 @@ public class OkxSpotConnector extends AbstractWebSocketConnector {
     }
 
     @Override
-    protected String buildSubscribeMessage(List<String> symbols) {
-        List<String> args = new ArrayList<>();
-
-        for (String symbol : symbols) {
-            args.add(String.format("{\"channel\":\"books50-l2-tbt\",\"instId\":\"%s\"}", symbol));
-            args.add(String.format("{\"channel\":\"trades\",\"instId\":\"%s\"}", symbol));
+    public void subscribe(List<String> symbols) {
+        if (!connected.get()) {
+            log.warn("[OKX:SPOT] Cannot subscribe - not connected");
+            return;
         }
 
-        return String.format("{\"op\":\"subscribe\",\"args\":[%s]}",
-                String.join(",", args));
+        String bookMsg = buildSubscribeForChannel(symbols, "books5");
+        webSocket.send(bookMsg);
+
+        try { Thread.sleep(100); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+
+        String tradeMsg = buildSubscribeForChannel(symbols, "trades");
+        webSocket.send(tradeMsg);
+
+        subscribedSymbols.addAll(symbols);
+        log.debug("[OKX:SPOT] Subscribed to {} symbols", symbols.size());
+    }
+
+    @Override
+    protected String buildSubscribeMessage(List<String> symbols) {
+        return buildSubscribeForChannel(symbols, "books5");
+    }
+
+    private String buildSubscribeForChannel(List<String> symbols, String channel) {
+        List<String> args = new ArrayList<>();
+        for (String symbol : symbols) {
+            args.add(String.format("{\"channel\":\"%s\",\"instId\":\"%s\"}", channel, symbol));
+        }
+        return String.format("{\"op\":\"subscribe\",\"args\":[%s]}", String.join(",", args));
     }
 
     @Override
@@ -183,7 +165,7 @@ public class OkxSpotConnector extends AbstractWebSocketConnector {
         String channel = arg.get("channel").asText();
         String instId = arg.get("instId").asText();
 
-        if ("books50-l2-tbt".equals(channel)) {
+        if ("books5".equals(channel)) {
             handleOrderBook(data.get(0), instId);
         } else if ("trades".equals(channel)) {
             handleTrades(data);

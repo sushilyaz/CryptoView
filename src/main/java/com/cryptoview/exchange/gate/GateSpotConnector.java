@@ -57,8 +57,6 @@ public class GateSpotConnector extends AbstractWebSocketConnector {
     public void subscribeAll() {
         List<String> symbols = fetchAllSymbols();
         if (!symbols.isEmpty()) {
-            preloadVolumes(symbols);
-
             if (!connectAndWait(5000)) {
                 log.error("[GATE:SPOT] Failed to connect WebSocket, aborting subscribe");
                 return;
@@ -79,40 +77,6 @@ public class GateSpotConnector extends AbstractWebSocketConnector {
             }
             log.info("[GATE:SPOT] Subscribed to {} symbols", symbols.size());
         }
-    }
-
-    @Override
-    protected void preloadVolumes(List<String> symbols) {
-        log.info("[GATE:SPOT] Pre-loading volumes for {} symbols...", symbols.size());
-        int loaded = 0;
-        for (int i = 0; i < symbols.size(); i += 5) {
-            int end = Math.min(i + 5, symbols.size());
-            for (int j = i; j < end; j++) {
-                String currencyPair = symbols.get(j);
-                String normalizedSymbol = currencyPair.replace("_", "");
-                try {
-                    String url = "https://api.gateio.ws/api/v4/spot/candlesticks?currency_pair=" + currencyPair + "&interval=1m&limit=15";
-                    Request request = new Request.Builder().url(url).build();
-                    try (Response response = httpClient.newCall(request).execute()) {
-                        if (response.isSuccessful() && response.body() != null) {
-                            JsonNode klines = objectMapper.readTree(response.body().string());
-                            BigDecimal totalVolume = BigDecimal.ZERO;
-                            if (klines != null && klines.isArray()) {
-                                for (JsonNode kline : klines) {
-                                    totalVolume = totalVolume.add(new BigDecimal(kline.get(1).asText())); // quote volume
-                                }
-                            }
-                            volumeTracker.seedVolume(normalizedSymbol, Exchange.GATE, MarketType.SPOT, totalVolume);
-                            loaded++;
-                        }
-                    }
-                } catch (Exception e) {
-                    log.debug("[GATE:SPOT] Failed to preload volume for {}: {}", currencyPair, e.getMessage());
-                }
-            }
-            try { Thread.sleep(500); } catch (InterruptedException e) { Thread.currentThread().interrupt(); break; }
-        }
-        log.info("[GATE:SPOT] Pre-loaded volume for {}/{} symbols", loaded, symbols.size());
     }
 
     private List<String> fetchAllSymbols() {

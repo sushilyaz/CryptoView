@@ -57,8 +57,6 @@ public class GateFuturesConnector extends AbstractWebSocketConnector {
     public void subscribeAll() {
         List<String> symbols = fetchAllSymbols();
         if (!symbols.isEmpty()) {
-            preloadVolumes(symbols);
-
             if (!connectAndWait(5000)) {
                 log.error("[GATE:FUTURES] Failed to connect WebSocket, aborting subscribe");
                 return;
@@ -79,43 +77,6 @@ public class GateFuturesConnector extends AbstractWebSocketConnector {
             }
             log.info("[GATE:FUTURES] Subscribed to {} symbols", symbols.size());
         }
-    }
-
-    @Override
-    protected void preloadVolumes(List<String> symbols) {
-        log.info("[GATE:FUTURES] Pre-loading volumes for {} symbols...", symbols.size());
-        int loaded = 0;
-        for (int i = 0; i < symbols.size(); i += 5) {
-            int end = Math.min(i + 5, symbols.size());
-            for (int j = i; j < end; j++) {
-                String contract = symbols.get(j);
-                String normalizedSymbol = contract.replace("_", "");
-                try {
-                    String url = "https://api.gateio.ws/api/v4/futures/usdt/candlesticks?contract=" + contract + "&interval=1m&limit=15";
-                    Request request = new Request.Builder().url(url).build();
-                    try (Response response = httpClient.newCall(request).execute()) {
-                        if (response.isSuccessful() && response.body() != null) {
-                            JsonNode klines = objectMapper.readTree(response.body().string());
-                            BigDecimal totalVolume = BigDecimal.ZERO;
-                            if (klines != null && klines.isArray()) {
-                                for (JsonNode kline : klines) {
-                                    // Gate futures candles have "sum" field for quote volume
-                                    if (kline.has("sum")) {
-                                        totalVolume = totalVolume.add(new BigDecimal(kline.get("sum").asText()));
-                                    }
-                                }
-                            }
-                            volumeTracker.seedVolume(normalizedSymbol, Exchange.GATE, MarketType.FUTURES, totalVolume);
-                            loaded++;
-                        }
-                    }
-                } catch (Exception e) {
-                    log.debug("[GATE:FUTURES] Failed to preload volume for {}: {}", contract, e.getMessage());
-                }
-            }
-            try { Thread.sleep(500); } catch (InterruptedException e) { Thread.currentThread().interrupt(); break; }
-        }
-        log.info("[GATE:FUTURES] Pre-loaded volume for {}/{} symbols", loaded, symbols.size());
     }
 
     private List<String> fetchAllSymbols() {

@@ -16,8 +16,7 @@ import org.springframework.stereotype.Component;
 
 import java.io.IOException;
 import java.math.BigDecimal;
-import java.util.ArrayList;
-import java.util.List;
+import java.util.*;
 import java.util.stream.Collectors;
 
 @Slf4j
@@ -56,66 +55,70 @@ public class MexcSpotConnector extends AbstractWebSocketConnector {
 
     @Override
     public void subscribeAll() {
-        List<String> symbols = fetchAllSymbols();
+        List<String> symbols = fetchTopSymbols();
         if (!symbols.isEmpty()) {
-            preloadVolumes(symbols);
-
             if (!connectAndWait(5000)) {
                 log.error("[MEXC:SPOT] Failed to connect WebSocket, aborting subscribe");
                 return;
             }
 
-            int batchSize = 30;
-            for (int i = 0; i < symbols.size(); i += batchSize) {
-                int end = Math.min(i + batchSize, symbols.size());
-                List<String> batch = symbols.subList(i, end);
-                subscribe(batch);
-
-                try {
-                    Thread.sleep(100);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    break;
-                }
-            }
+            // MEXC limit: 30 subscriptions per connection
+            // Each symbol = 2 subs (depth + deals), so max 15 symbols
+            subscribe(symbols);
             log.info("[MEXC:SPOT] Subscribed to {} symbols", symbols.size());
         }
     }
 
-    @Override
-    protected void preloadVolumes(List<String> symbols) {
-        log.info("[MEXC:SPOT] Pre-loading volumes for {} symbols...", symbols.size());
-        int loaded = 0;
-        for (int i = 0; i < symbols.size(); i += 5) {
-            int end = Math.min(i + 5, symbols.size());
-            for (int j = i; j < end; j++) {
-                String symbol = symbols.get(j);
-                try {
-                    String url = "https://api.mexc.com/api/v3/klines?symbol=" + symbol + "&interval=1m&limit=15";
-                    Request request = new Request.Builder().url(url).build();
-                    try (Response response = httpClient.newCall(request).execute()) {
-                        if (response.isSuccessful() && response.body() != null) {
-                            JsonNode klines = objectMapper.readTree(response.body().string());
-                            BigDecimal totalVolume = BigDecimal.ZERO;
-                            if (klines != null && klines.isArray()) {
-                                for (JsonNode kline : klines) {
-                                    totalVolume = totalVolume.add(new BigDecimal(kline.get(7).asText())); // quoteAssetVolume
-                                }
-                            }
-                            volumeTracker.seedVolume(symbol, Exchange.MEXC, MarketType.SPOT, totalVolume);
-                            loaded++;
-                        }
+    // MEXC allows max 30 subscriptions per WS connection.
+    // Each symbol = 2 subs (depth + deals), so we fetch top 15 symbols by 24h volume.
+    private static final int MAX_SYMBOLS = 15;
+    private static final String TICKER_URL = "https://api.mexc.com/api/v3/ticker/24hr";
+
+    private List<String> fetchTopSymbols() {
+        // First get valid USDT trading pairs
+        List<String> validSymbols = fetchValidSymbols();
+        if (validSymbols.isEmpty()) return List.of();
+
+        // Then get 24h tickers to sort by volume
+        Request tickerRequest = new Request.Builder()
+                .url(TICKER_URL)
+                .build();
+
+        try (Response response = executeWithRetry(tickerRequest, 3, 5000)) {
+            if (response.body() != null) {
+                JsonNode tickers = objectMapper.readTree(response.body().string());
+                Set<String> validSet = new java.util.HashSet<>(validSymbols);
+
+                List<String> topSymbols = new ArrayList<>();
+                // Collect symbols with volume
+                List<java.util.Map.Entry<String, Double>> symbolVolumes = new ArrayList<>();
+                for (JsonNode ticker : tickers) {
+                    String symbol = ticker.get("symbol").asText();
+                    if (validSet.contains(symbol) && ticker.has("quoteVolume")) {
+                        double volume = ticker.get("quoteVolume").asDouble();
+                        symbolVolumes.add(java.util.Map.entry(symbol, volume));
                     }
-                } catch (Exception e) {
-                    log.debug("[MEXC:SPOT] Failed to preload volume for {}: {}", symbol, e.getMessage());
                 }
+
+                // Sort by volume descending, take top N
+                symbolVolumes.sort((a, b) -> Double.compare(b.getValue(), a.getValue()));
+                for (int i = 0; i < Math.min(MAX_SYMBOLS, symbolVolumes.size()); i++) {
+                    topSymbols.add(symbolVolumes.get(i).getKey());
+                }
+
+                log.info("[MEXC:SPOT] Selected top {} symbols by volume from {} total",
+                        topSymbols.size(), validSymbols.size());
+                return topSymbols;
             }
-            try { Thread.sleep(500); } catch (InterruptedException e) { Thread.currentThread().interrupt(); break; }
+        } catch (IOException e) {
+            log.error("[MEXC:SPOT] Failed to fetch tickers, falling back to first {} symbols", MAX_SYMBOLS, e);
         }
-        log.info("[MEXC:SPOT] Pre-loaded volume for {}/{} symbols", loaded, symbols.size());
+
+        // Fallback: just take first N
+        return validSymbols.subList(0, Math.min(MAX_SYMBOLS, validSymbols.size()));
     }
 
-    private List<String> fetchAllSymbols() {
+    private List<String> fetchValidSymbols() {
         Request request = new Request.Builder()
                 .url(REST_URL)
                 .build();
@@ -169,8 +172,17 @@ public class MexcSpotConnector extends AbstractWebSocketConnector {
         JsonNode root = parseJson(message);
         if (root == null) return;
 
-        // Пропускаем служебные сообщения
-        if (root.has("msg") || root.has("code")) {
+        // Log subscription responses
+        if (root.has("msg")) {
+            String msg = root.get("msg").asText();
+            if (msg.contains("Not Subscribed")) {
+                log.warn("[MEXC:SPOT] Subscription failed: {}", msg.length() > 200 ? msg.substring(0, 200) + "..." : msg);
+            } else {
+                log.debug("[MEXC:SPOT] Service message: {}", msg);
+            }
+            return;
+        }
+        if (root.has("code")) {
             return;
         }
 

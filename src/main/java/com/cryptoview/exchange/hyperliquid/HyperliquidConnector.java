@@ -62,8 +62,6 @@ public class HyperliquidConnector extends AbstractWebSocketConnector {
     public void subscribeAll() {
         List<String> symbols = fetchAllSymbols();
         if (!symbols.isEmpty()) {
-            preloadVolumes(symbols);
-
             if (!connectAndWait(5000)) {
                 log.error("[HYPERLIQUID] Failed to connect WebSocket, aborting subscribe");
                 return;
@@ -82,54 +80,6 @@ public class HyperliquidConnector extends AbstractWebSocketConnector {
             }
             log.info("[HYPERLIQUID] Subscribed to {} symbols", symbols.size());
         }
-    }
-
-    @Override
-    protected void preloadVolumes(List<String> symbols) {
-        log.info("[HYPERLIQUID] Pre-loading volumes for {} symbols...", symbols.size());
-        int loaded = 0;
-        for (int i = 0; i < symbols.size(); i += 5) {
-            int end = Math.min(i + 5, symbols.size());
-            for (int j = i; j < end; j++) {
-                String coin = symbols.get(j);
-                String symbol = coin + "USDC";
-                try {
-                    long now = System.currentTimeMillis();
-                    long fifteenMinAgo = now - 15 * 60 * 1000;
-                    String body = String.format(
-                            "{\"type\":\"candleSnapshot\",\"req\":{\"coin\":\"%s\",\"interval\":\"1m\",\"startTime\":%d,\"endTime\":%d}}",
-                            coin, fifteenMinAgo, now
-                    );
-                    Request request = new Request.Builder()
-                            .url(REST_URL)
-                            .post(okhttp3.RequestBody.create(body, okhttp3.MediaType.get("application/json")))
-                            .build();
-                    try (Response response = httpClient.newCall(request).execute()) {
-                        if (response.isSuccessful() && response.body() != null) {
-                            JsonNode candles = objectMapper.readTree(response.body().string());
-                            BigDecimal totalVolume = BigDecimal.ZERO;
-                            if (candles != null && candles.isArray()) {
-                                for (JsonNode candle : candles) {
-                                    // Hyperliquid candle: {t, T, s, i, o, c, h, l, v, n}
-                                    // v = base volume, approximate quote volume = avg(o,c) * v
-                                    BigDecimal open = new BigDecimal(candle.get("o").asText());
-                                    BigDecimal close = new BigDecimal(candle.get("c").asText());
-                                    BigDecimal vol = new BigDecimal(candle.get("v").asText());
-                                    BigDecimal avgPrice = open.add(close).divide(BigDecimal.valueOf(2), 8, RoundingMode.HALF_UP);
-                                    totalVolume = totalVolume.add(avgPrice.multiply(vol));
-                                }
-                            }
-                            volumeTracker.seedVolume(symbol, Exchange.HYPERLIQUID, marketType, totalVolume);
-                            loaded++;
-                        }
-                    }
-                } catch (Exception e) {
-                    log.debug("[HYPERLIQUID] Failed to preload volume for {}: {}", coin, e.getMessage());
-                }
-            }
-            try { Thread.sleep(500); } catch (InterruptedException e) { Thread.currentThread().interrupt(); break; }
-        }
-        log.info("[HYPERLIQUID] Pre-loaded volume for {}/{} symbols", loaded, symbols.size());
     }
 
     private List<String> fetchAllSymbols() {

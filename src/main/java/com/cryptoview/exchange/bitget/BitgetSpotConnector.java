@@ -57,8 +57,6 @@ public class BitgetSpotConnector extends AbstractWebSocketConnector {
     public void subscribeAll() {
         List<String> symbols = fetchAllSymbols();
         if (!symbols.isEmpty()) {
-            preloadVolumes(symbols);
-
             if (!connectAndWait(5000)) {
                 log.error("[BITGET:SPOT] Failed to connect WebSocket, aborting subscribe");
                 return;
@@ -79,40 +77,6 @@ public class BitgetSpotConnector extends AbstractWebSocketConnector {
             }
             log.info("[BITGET:SPOT] Subscribed to {} symbols", symbols.size());
         }
-    }
-
-    @Override
-    protected void preloadVolumes(List<String> symbols) {
-        log.info("[BITGET:SPOT] Pre-loading volumes for {} symbols...", symbols.size());
-        int loaded = 0;
-        for (int i = 0; i < symbols.size(); i += 5) {
-            int end = Math.min(i + 5, symbols.size());
-            for (int j = i; j < end; j++) {
-                String symbol = symbols.get(j);
-                try {
-                    String url = "https://api.bitget.com/api/v2/spot/market/candles?symbol=" + symbol + "&granularity=1min&limit=15";
-                    Request request = new Request.Builder().url(url).build();
-                    try (Response response = httpClient.newCall(request).execute()) {
-                        if (response.isSuccessful() && response.body() != null) {
-                            JsonNode root = objectMapper.readTree(response.body().string());
-                            JsonNode data = root.get("data");
-                            BigDecimal totalVolume = BigDecimal.ZERO;
-                            if (data != null && data.isArray()) {
-                                for (JsonNode kline : data) {
-                                    totalVolume = totalVolume.add(new BigDecimal(kline.get(6).asText())); // quoteVolume
-                                }
-                            }
-                            volumeTracker.seedVolume(symbol, Exchange.BITGET, MarketType.SPOT, totalVolume);
-                            loaded++;
-                        }
-                    }
-                } catch (Exception e) {
-                    log.debug("[BITGET:SPOT] Failed to preload volume for {}: {}", symbol, e.getMessage());
-                }
-            }
-            try { Thread.sleep(500); } catch (InterruptedException e) { Thread.currentThread().interrupt(); break; }
-        }
-        log.info("[BITGET:SPOT] Pre-loaded volume for {}/{} symbols", loaded, symbols.size());
     }
 
     private List<String> fetchAllSymbols() {
@@ -181,10 +145,10 @@ public class BitgetSpotConnector extends AbstractWebSocketConnector {
         String channel = arg.get("channel").asText();
         String instId = arg.get("instId").asText();
 
-        if ("books50".equals(channel)) {
+        if ("books15".equals(channel)) {
             handleOrderBook(data, instId);
         } else if ("trade".equals(channel)) {
-            handleTrades(data);
+            handleTrades(data, instId);
         }
     }
 
@@ -210,24 +174,20 @@ public class BitgetSpotConnector extends AbstractWebSocketConnector {
         }
     }
 
-    private void handleTrades(JsonNode data) {
+    private void handleTrades(JsonNode data, String instId) {
         if (!data.isArray()) {
             return;
         }
 
         for (JsonNode trade : data) {
-            String symbol = trade.has("instId") ? trade.get("instId").asText() :
-                    (trade.has("symbol") ? trade.get("symbol").asText() : null);
-            if (symbol == null) continue;
-
             BigDecimal price = new BigDecimal(trade.get("price").asText());
             BigDecimal quantity = new BigDecimal(trade.get("size").asText());
 
             incrementTradeUpdates();
-            orderBookManager.updateLastPrice(symbol, Exchange.BITGET, MarketType.SPOT, price);
+            orderBookManager.updateLastPrice(instId, Exchange.BITGET, MarketType.SPOT, price);
 
             volumeTracker.addVolume(
-                    symbol,
+                    instId,
                     Exchange.BITGET,
                     MarketType.SPOT,
                     price.multiply(quantity)

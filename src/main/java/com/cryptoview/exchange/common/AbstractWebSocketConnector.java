@@ -49,6 +49,7 @@ public abstract class AbstractWebSocketConnector implements ExchangeConnector {
     private static final int MAX_RECONNECT_ATTEMPTS = 10;
     private static final long INITIAL_RECONNECT_DELAY_MS = 1000;
     private static final long MAX_RECONNECT_DELAY_MS = 60000;
+    private static final long STALE_DATA_THRESHOLD_MS = 90_000; // 90 seconds
 
     protected AbstractWebSocketConnector(OkHttpClient httpClient,
                                           ObjectMapper objectMapper,
@@ -273,9 +274,23 @@ public abstract class AbstractWebSocketConnector implements ExchangeConnector {
         stopPingTask();
         pingTask = scheduler.scheduleAtFixedRate(() -> {
             if (connected.get() && webSocket != null) {
+                // Send ping
                 String ping = getPingMessage();
                 if (ping != null) {
                     webSocket.send(ping);
+                }
+
+                // Stale data detection: if we have subscriptions but no messages for too long, force reconnect
+                Instant lastMsg = lastMessageTime.get();
+                if (lastMsg != null && !subscribedSymbols.isEmpty()) {
+                    long silenceMs = java.time.Duration.between(lastMsg, Instant.now()).toMillis();
+                    if (silenceMs > STALE_DATA_THRESHOLD_MS) {
+                        log.warn("[{}:{}] Stale connection detected (no data for {}s), forcing reconnect",
+                                getExchange(), getMarketType(), silenceMs / 1000);
+                        if (webSocket != null) {
+                            webSocket.close(1000, "Stale data reconnect");
+                        }
+                    }
                 }
             }
         }, getPingIntervalMs(), getPingIntervalMs(), TimeUnit.MILLISECONDS);
@@ -333,10 +348,6 @@ public abstract class AbstractWebSocketConnector implements ExchangeConnector {
             }
         }
         throw lastException != null ? lastException : new IOException("Request failed after " + maxRetries + " attempts");
-    }
-
-    protected void preloadVolumes(List<String> symbols) {
-        // Default no-op, override in subclasses
     }
 
     protected void incrementOrderbookUpdates() {

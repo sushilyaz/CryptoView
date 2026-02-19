@@ -57,8 +57,6 @@ public class BitgetFuturesConnector extends AbstractWebSocketConnector {
     public void subscribeAll() {
         List<String> symbols = fetchAllSymbols();
         if (!symbols.isEmpty()) {
-            preloadVolumes(symbols);
-
             if (!connectAndWait(5000)) {
                 log.error("[BITGET:FUTURES] Failed to connect WebSocket, aborting subscribe");
                 return;
@@ -79,41 +77,6 @@ public class BitgetFuturesConnector extends AbstractWebSocketConnector {
             }
             log.info("[BITGET:FUTURES] Subscribed to {} symbols", symbols.size());
         }
-    }
-
-    @Override
-    protected void preloadVolumes(List<String> symbols) {
-        log.info("[BITGET:FUTURES] Pre-loading volumes for {} symbols...", symbols.size());
-        int loaded = 0;
-        for (int i = 0; i < symbols.size(); i += 5) {
-            int end = Math.min(i + 5, symbols.size());
-            for (int j = i; j < end; j++) {
-                String symbol = symbols.get(j);
-                try {
-                    String url = "https://api.bitget.com/api/v2/mix/market/candles?productType=USDT-FUTURES&symbol=" + symbol + "&granularity=1m&limit=15";
-                    Request request = new Request.Builder().url(url).build();
-                    try (Response response = httpClient.newCall(request).execute()) {
-                        if (response.isSuccessful() && response.body() != null) {
-                            JsonNode root = objectMapper.readTree(response.body().string());
-                            JsonNode data = root.get("data");
-                            BigDecimal totalVolume = BigDecimal.ZERO;
-                            if (data != null && data.isArray()) {
-                                for (JsonNode kline : data) {
-                                    totalVolume = totalVolume.add(new BigDecimal(kline.get(6).asText()));
-                                }
-                            }
-                            String normalizedSymbol = symbol.replace("_", "");
-                            volumeTracker.seedVolume(normalizedSymbol, Exchange.BITGET, MarketType.FUTURES, totalVolume);
-                            loaded++;
-                        }
-                    }
-                } catch (Exception e) {
-                    log.debug("[BITGET:FUTURES] Failed to preload volume for {}: {}", symbol, e.getMessage());
-                }
-            }
-            try { Thread.sleep(500); } catch (InterruptedException e) { Thread.currentThread().interrupt(); break; }
-        }
-        log.info("[BITGET:FUTURES] Pre-loaded volume for {}/{} symbols", loaded, symbols.size());
     }
 
     private List<String> fetchAllSymbols() {
@@ -180,7 +143,7 @@ public class BitgetFuturesConnector extends AbstractWebSocketConnector {
         String channel = arg.get("channel").asText();
         String instId = arg.get("instId").asText();
 
-        if ("books50".equals(channel)) {
+        if ("books15".equals(channel)) {
             handleOrderBook(data, instId);
         } else if ("trade".equals(channel)) {
             handleTrades(data, instId);
