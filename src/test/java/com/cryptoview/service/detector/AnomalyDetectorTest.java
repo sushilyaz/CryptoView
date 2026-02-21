@@ -61,6 +61,7 @@ class AnomalyDetectorTest {
 
         when(configService.getEffectiveConfig(any(), any(), any())).thenReturn(config);
         when(volumeTracker.getVolume15Min(any(), any(), any())).thenReturn(new BigDecimal("500000"));
+        when(volumeTracker.getTrackingAgeSec(any(), any(), any())).thenReturn(600L);
 
         // Create orderbook with anomalous density
         List<OrderBookLevel> bids = new ArrayList<>();

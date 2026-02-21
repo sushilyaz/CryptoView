@@ -2,6 +2,7 @@ plugins {
     id 'java'
     id 'org.springframework.boot' version '4.0.2'
     id 'io.spring.dependency-management' version '1.1.7'
+    id 'com.google.protobuf' version '0.9.4'
 }
 
 group = 'com.cryptoview'
@@ -42,6 +43,9 @@ dependencies {
     // Apache Commons для математики
     implementation 'org.apache.commons:commons-math3:3.6.1'
 
+    // Protobuf (MEXC WebSocket)
+    implementation 'com.google.protobuf:protobuf-java:3.25.3'
+
     // Dotenv — загрузка переменных из .env файла
     implementation platform('me.paulschwarz:spring-dotenv-bom:5.1.0')
     runtimeOnly 'me.paulschwarz:springboot4-dotenv'
@@ -53,6 +57,12 @@ dependencies {
 
 tasks.named('test') {
     useJUnitPlatform()
+}
+
+protobuf {
+    protoc {
+        artifact = 'com.google.protobuf:protoc:3.25.3'
+    }
 }
 
 tasks.withType(JavaCompile).configureEach {

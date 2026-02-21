@@ -1,0 +1,174 @@
+syntax = "proto3";
+
+option java_package = "com.cryptoview.exchange.mexc.proto";
+option java_outer_classname = "MexcProto";
+option java_multiple_files = false;
+
+// Limit Depth (Snapshot) item
+message PublicLimitDepthV3ApiItem {
+  string price = 1;
+  string quantity = 2;
+}
+
+// Limit Depth (Snapshot) — partial orderbook snapshot
+message PublicLimitDepthsV3Api {
+  repeated PublicLimitDepthV3ApiItem asks = 1;
+  repeated PublicLimitDepthV3ApiItem bids = 2;
+  string eventType = 3;
+  string version = 4;
+}
+
+// Deals (Trades) item
+message PublicDealsV3ApiItem {
+  string price = 1;
+  string quantity = 2;
+  int32 tradeType = 3;   // 1=BUY, 2=SELL
+  int64 time = 4;
+}
+
+// Deals (Trades)
+message PublicDealsV3Api {
+  repeated PublicDealsV3ApiItem deals = 1;
+  string eventType = 2;
+}
+
+// Aggregated Deals item
+message PublicAggreDealsV3ApiItem {
+  string price = 1;
+  string quantity = 2;
+  int32 tradeType = 3;
+  int64 time = 4;
+}
+
+// Aggregated Deals
+message PublicAggreDealsV3Api {
+  repeated PublicAggreDealsV3ApiItem deals = 1;
+  string eventType = 2;
+}
+
+// Incremental Depth item
+message PublicIncreaseDepthV3ApiItem {
+  string price = 1;
+  string quantity = 2;
+}
+
+// Incremental Depth
+message PublicIncreaseDepthsV3Api {
+  repeated PublicIncreaseDepthV3ApiItem asks = 1;
+  repeated PublicIncreaseDepthV3ApiItem bids = 2;
+  string eventType = 3;
+  string version = 4;
+}
+
+// Aggregated Depth item
+message PublicAggreDepthV3ApiItem {
+  string price = 1;
+  string quantity = 2;
+}
+
+// Aggregated Depth
+message PublicAggreDepthsV3Api {
+  repeated PublicAggreDepthV3ApiItem asks = 1;
+  repeated PublicAggreDepthV3ApiItem bids = 2;
+  string eventType = 3;
+  string fromVersion = 4;
+  string toVersion = 5;
+}
+
+// Book Ticker
+message PublicBookTickerV3Api {
+  string bidPrice = 1;
+  string bidQuantity = 2;
+  string askPrice = 3;
+  string askQuantity = 4;
+}
+
+// Mini Ticker
+message PublicMiniTickerV3Api {
+  string symbol = 1;
+  string lastPrice = 2;
+  string riseFallRate = 3;
+  string riseFallValue = 4;
+  string volume = 5;
+  string amount = 6;
+  string highPrice = 7;
+  string lowPrice = 8;
+  string openPrice = 9;
+  string timezone = 10;
+}
+
+// Mini Tickers batch
+message PublicMiniTickersV3Api {
+  repeated PublicMiniTickerV3Api items = 1;
+}
+
+// Book Ticker batch
+message PublicBookTickerBatchV3Api {
+  repeated PublicBookTickerV3Api items = 1;
+}
+
+// Increase Depths batch
+message PublicIncreaseDepthsBatchV3Api {
+  repeated PublicIncreaseDepthsV3Api items = 1;
+}
+
+// Aggregated Book Ticker
+message PublicAggreBookTickerV3Api {
+  string bidPrice = 1;
+  string bidQuantity = 2;
+  string askPrice = 3;
+  string askQuantity = 4;
+}
+
+// Spot Kline
+message PublicSpotKlineV3Api {
+  string interval = 1;
+  int64 openTime = 2;
+  string openPrice = 3;
+  string closePrice = 4;
+  string highPrice = 5;
+  string lowPrice = 6;
+  string volume = 7;
+  string amount = 8;
+}
+
+// Private types (not used in CryptoView, but needed for wrapper oneof)
+message PrivateOrdersV3Api {
+  string data = 1;
+}
+
+message PrivateDealsV3Api {
+  string data = 1;
+}
+
+message PrivateAccountV3Api {
+  string data = 1;
+}
+
+// Main wrapper — every binary message is this type
+message PushDataV3ApiWrapper {
+  string channel = 1;
+
+  oneof body {
+    PublicDealsV3Api publicDeals = 301;
+    PublicIncreaseDepthsV3Api publicIncreaseDepths = 302;
+    PublicLimitDepthsV3Api publicLimitDepths = 303;
+    PrivateOrdersV3Api privateOrders = 304;
+    PublicBookTickerV3Api publicBookTicker = 305;
+    PrivateDealsV3Api privateDeals = 306;
+    PrivateAccountV3Api privateAccount = 307;
+    PublicSpotKlineV3Api publicSpotKline = 308;
+    PublicMiniTickerV3Api publicMiniTicker = 309;
+    PublicMiniTickersV3Api publicMiniTickers = 310;
+    PublicBookTickerBatchV3Api publicBookTickerBatch = 311;
+    PublicIncreaseDepthsBatchV3Api publicIncreaseDepthsBatch = 312;
+    PublicAggreDepthsV3Api publicAggreDepths = 313;
+    PublicAggreDealsV3Api publicAggreDeals = 314;
+    PublicAggreBookTickerV3Api publicAggreBookTicker = 315;
+  }
+
+  optional string symbol = 3;
+  optional string symbolId = 4;
+  optional int64 createTime = 5;
+  optional int64 sendTime = 6;
+}
