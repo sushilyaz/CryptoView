@@ -163,6 +163,10 @@ public class ConfigService {
         }
     }
 
+    public BigDecimal getGlobalMinimumDensityFloor() {
+        return properties.getGlobal().getMinDensityUsd();
+    }
+
     public boolean isExchangeMarketEnabled(Exchange exchange, MarketType marketType) {
         // MEXC Futures отключён
         if (exchange == Exchange.MEXC && marketType == MarketType.FUTURES) {
