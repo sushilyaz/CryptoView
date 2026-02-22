@@ -18,6 +18,8 @@ import java.io.IOException;
 import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 @Slf4j
 @Component
@@ -25,6 +27,10 @@ public class OkxFuturesConnector extends AbstractWebSocketConnector {
 
     private static final String WS_URL = "wss://ws.okx.com:8443/ws/v5/public";
     private static final String REST_URL = "https://www.okx.com/api/v5/public/instruments?instType=SWAP";
+
+    // OKX futures: sz = number of contracts, real quantity = sz * ctVal
+    // Key: instId (e.g. "BTC-USDT-SWAP"), Value: ctVal (e.g. 0.01)
+    private final Map<String, BigDecimal> contractValues = new ConcurrentHashMap<>();
 
     public OkxFuturesConnector(OkHttpClient httpClient,
                                 ObjectMapper objectMapper,
@@ -99,11 +105,16 @@ public class OkxFuturesConnector extends AbstractWebSocketConnector {
                         // USDT-settled perpetual swaps
                         if ("live".equals(state) && "USDT".equals(settleCcy)) {
                             usdtSymbols.add(instId);
+
+                            // Save contract value for converting contracts -> base currency
+                            String ctVal = inst.has("ctVal") ? inst.get("ctVal").asText() : "1";
+                            contractValues.put(instId, new BigDecimal(ctVal));
                         }
                     }
                 }
 
-                log.info("[OKX:FUTURES] Found {} USDT-M perpetual swaps", usdtSymbols.size());
+                log.info("[OKX:FUTURES] Found {} USDT-M perpetual swaps, loaded {} contract values",
+                        usdtSymbols.size(), contractValues.size());
                 return usdtSymbols;
             }
         } catch (IOException e) {
@@ -173,8 +184,9 @@ public class OkxFuturesConnector extends AbstractWebSocketConnector {
     }
 
     private void handleOrderBook(JsonNode data, String instId) {
-        List<OrderBookLevel> bids = parseOrderBookLevels(data.get("bids"));
-        List<OrderBookLevel> asks = parseOrderBookLevels(data.get("asks"));
+        BigDecimal ctVal = contractValues.getOrDefault(instId, BigDecimal.ONE);
+        List<OrderBookLevel> bids = parseOrderBookLevels(data.get("bids"), ctVal);
+        List<OrderBookLevel> asks = parseOrderBookLevels(data.get("asks"), ctVal);
 
         // OKX instId format: BTC-USDT-SWAP -> BTCUSDT
         String symbol = instId.replace("-SWAP", "").replace("-", "");
@@ -197,7 +209,11 @@ public class OkxFuturesConnector extends AbstractWebSocketConnector {
             String instId = trade.get("instId").asText();
             String symbol = instId.replace("-SWAP", "").replace("-", "");
             BigDecimal price = new BigDecimal(trade.get("px").asText());
-            BigDecimal quantity = new BigDecimal(trade.get("sz").asText());
+            BigDecimal szContracts = new BigDecimal(trade.get("sz").asText());
+
+            // Convert contracts to base currency: realQty = sz * ctVal
+            BigDecimal ctVal = contractValues.getOrDefault(instId, BigDecimal.ONE);
+            BigDecimal quantity = szContracts.multiply(ctVal);
 
             incrementTradeUpdates();
             orderBookManager.updateLastPrice(symbol, Exchange.OKX, MarketType.FUTURES, price);
@@ -211,7 +227,7 @@ public class OkxFuturesConnector extends AbstractWebSocketConnector {
         }
     }
 
-    private List<OrderBookLevel> parseOrderBookLevels(JsonNode levels) {
+    private List<OrderBookLevel> parseOrderBookLevels(JsonNode levels, BigDecimal ctVal) {
         List<OrderBookLevel> result = new ArrayList<>();
         if (levels == null || !levels.isArray()) {
             return result;
@@ -219,7 +235,9 @@ public class OkxFuturesConnector extends AbstractWebSocketConnector {
 
         for (JsonNode level : levels) {
             BigDecimal price = new BigDecimal(level.get(0).asText());
-            BigDecimal quantity = new BigDecimal(level.get(1).asText());
+            BigDecimal szContracts = new BigDecimal(level.get(1).asText());
+            // Convert contracts to base currency: realQty = sz * ctVal
+            BigDecimal quantity = szContracts.multiply(ctVal);
             if (quantity.compareTo(BigDecimal.ZERO) > 0) {
                 result.add(new OrderBookLevel(price, quantity));
             }
