@@ -128,6 +128,41 @@
 
 ---
 
+## Фаза 1.7: Diff-based depth (глубокие стаканы)
+
+Рефакторинг всех коннекторов с snapshot-based (ограниченная глубина) на diff-based incremental (полная/расширенная глубина) с использованием `LocalOrderBook`.
+
+### Этап 19: LocalOrderBook — общий класс для diff-based управления ✅
+- [x] Thread-safe TreeMap с ReentrantReadWriteLock
+- [x] Поддержка snapshot + delta (qty=0 → удалить уровень)
+- [x] Tracking: lastUpdateId, lastSeqId
+- [x] Метод getSnapshot(quantityMultiplier) для futures ctVal конвертации
+
+### Этап 20: Binance Spot/Futures — diff-based depth ✅
+- [x] Spot: `@depth@100ms` + REST snapshot `/api/v3/depth?limit=5000`
+- [x] Futures: `@depth@500ms` + REST snapshot `/fapi/v1/depth?limit=1000`
+- [x] Event buffering до snapshot, gap detection по U/pu
+- [x] Virtual threads для snapshot fetching, rate limiting
+
+### Этап 21: Bybit Spot/Futures — orderbook.200 ✅
+- [x] `orderbook.200` канал (200 уровней, snapshot + delta)
+- [x] Tracking по u (updateId) и seq
+
+### Этап 22: OKX Spot/Futures — books канал (400 уровней) ✅
+- [x] `books` канал вместо `books5` (400 уровней, incremental)
+- [x] seqId/prevSeqId gap detection + REST snapshot fallback
+- [x] Futures: ctVal multiplier через getSnapshot(ctVal)
+
+### Этап 23: Bitget Spot/Futures — books канал (полная глубина) ✅
+- [x] `books` канал вместо `books15` (полная глубина, incremental)
+- [x] seq/pseq gap detection + REST snapshot fallback
+- [x] Spot: `/api/v2/spot/market/orderbook`, Futures: `/api/v2/mix/market/merge-depth`
+
+### Этап 24: Документация ✅
+- [x] Обновление CLAUDE.md, TECHNICAL_SPECIFICATION.md, WORK_PLAN.md, README.md
+
+---
+
 ## Фаза 2: Frontend (планируется)
 
 ### Этап 1: Инициализация
@@ -174,6 +209,12 @@
 | 16. WebSocket стрим | Средняя | ✅ |
 | 17. ConfigService | Низкая | ✅ |
 | 18. Документация | Низкая | ✅ |
+| 19. LocalOrderBook | Средняя | ✅ |
+| 20. Binance diff-based | Высокая | ✅ |
+| 21. Bybit orderbook.200 | Средняя | ✅ |
+| 22. OKX books (400) | Средняя | ✅ |
+| 23. Bitget books (full) | Средняя | ✅ |
+| 24. Документация | Низкая | ✅ |
 
 ---
 
@@ -216,6 +257,20 @@
         │
         ▼
 [16. WebSocket стрим] ✅
+        │
+        ▼
+[19. LocalOrderBook] ✅
+        │
+        ├──────────────────────────┐
+        ▼                          ▼
+[20. Binance diff-based] ✅  [21. Bybit orderbook.200] ✅
+        │                          │
+        ├──────────────────────────┘
+        ▼
+[22. OKX books (400)] ✅
+        │
+        ▼
+[23. Bitget books (full)] ✅
 ```
 
 ---

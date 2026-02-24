@@ -464,23 +464,40 @@ ws://localhost:8080/ws/densities?workspaceId=<uuid>
 ### 7.1 Binance
 - **Spot WebSocket:** `wss://stream.binance.com:9443/stream` (combined stream)
 - **Futures WebSocket:** `wss://fstream.binance.com/stream` (combined stream)
-- **Orderbook stream:** `<symbol>@depth20@500ms` (partial depth, 20 уровней)
+- **Orderbook:** diff-based incremental depth
+  - Spot: `<symbol>@depth@100ms`, Futures: `<symbol>@depth@500ms`
+  - Требует REST snapshot: Spot `/api/v3/depth?limit=5000`, Futures `/fapi/v1/depth?limit=1000`
+  - Event buffering до snapshot, gap detection по `U` (Spot) / `pu` (Futures)
+  - Используется `LocalOrderBook` для управления состоянием
 - **Trade stream:** Spot: `<symbol>@trade`, Futures: `<symbol>@aggTrade`
+- **Лимит:** 1024 стрима на соединение (512 символов × 2 стрима)
 
 ### 7.2 Bybit
 - **Spot WebSocket:** `wss://stream.bybit.com/v5/public/spot`
 - **Futures WebSocket:** `wss://stream.bybit.com/v5/public/linear`
-- **Orderbook stream:** `orderbook.50.<symbol>` (50 уровней)
+- **Orderbook:** `orderbook.200.<symbol>` — 200 уровней, incremental
+  - `type: "snapshot"` → полный стакан, `type: "delta"` → инкрементальное обновление
+  - Tracking: `u` (updateId), `seq` (sequence)
+  - Используется `LocalOrderBook`
 
 ### 7.3 OKX
 - **WebSocket:** `wss://ws.okx.com:8443/ws/v5/public`
-- **Orderbook channel:** `books5` (5 уровней, единственный канал без лимита подписок)
+- **Orderbook:** `books` канал — 400 уровней, incremental
+  - `action: "snapshot"` → первое сообщение, `action: "update"` → дельта
+  - Tracking: `seqId`, `prevSeqId` для gap detection
+  - REST fallback: `/api/v5/market/books?instId=X&sz=400`
+  - Используется `LocalOrderBook`
 - **Trade channel:** `trades`
+- **Futures ctVal:** `sz` = кол-во контрактов, реальное qty = `sz × ctVal`. ctVal загружается из `/api/v5/public/instruments?instType=SWAP`
 - **Особенность:** подписки orderbook и trades отправляются отдельными WS-сообщениями
 
 ### 7.4 Bitget
 - **WebSocket:** `wss://ws.bitget.com/v2/ws/public` (API v2)
-- **Orderbook channel:** `books15` (15 уровней)
+- **Orderbook:** `books` канал — полная глубина, incremental
+  - `action: "snapshot"` → полный стакан, `action: "update"` → дельта
+  - Tracking: `seq`, `pseq` (previous sequence) для gap detection
+  - REST fallback: Spot `/api/v2/spot/market/orderbook`, Futures `/api/v2/mix/market/merge-depth`
+  - Используется `LocalOrderBook`
 - **Trade channel:** `trade`
 
 ### 7.5 Gate (отключена)
@@ -489,9 +506,10 @@ ws://localhost:8080/ws/densities?workspaceId=<uuid>
 - **Статус:** отключена из-за SocketTimeoutException при подключении
 
 ### 7.6 MEXC (только Spot)
-- **WebSocket:** `wss://wbs.mexc.com/ws`
-- **Формат:** Protobuf + WebSocket connection pool
+- **WebSocket:** `wss://wbs-api.mexc.com/ws`
+- **Формат:** Protobuf (PushDataV3ApiWrapper) + WebSocket connection pool (15 символов/соединение)
 - **Глубина:** до 20 уровней
+- **Особенности:** подписки JSON, данные binary protobuf, каналы с суффиксом `.pb`
 
 ### 7.7 Hyperliquid (только Futures)
 - **WebSocket:** `wss://api.hyperliquid.xyz/ws`

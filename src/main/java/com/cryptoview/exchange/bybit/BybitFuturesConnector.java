@@ -1,7 +1,7 @@
 package com.cryptoview.exchange.bybit;
 
 import com.cryptoview.exchange.common.AbstractWebSocketConnector;
-import com.cryptoview.model.domain.OrderBookLevel;
+import com.cryptoview.exchange.common.LocalOrderBook;
 import com.cryptoview.model.enums.Exchange;
 import com.cryptoview.model.enums.MarketType;
 import com.cryptoview.service.orderbook.OrderBookManager;
@@ -18,6 +18,8 @@ import java.io.IOException;
 import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
 @Slf4j
@@ -26,6 +28,8 @@ public class BybitFuturesConnector extends AbstractWebSocketConnector {
 
     private static final String WS_URL = "wss://stream.bybit.com/v5/public/linear";
     private static final String REST_URL = "https://api.bybit.com/v5/market/instruments-info?category=linear";
+
+    private final Map<String, LocalOrderBook> localBooks = new ConcurrentHashMap<>();
 
     public BybitFuturesConnector(OkHttpClient httpClient,
                                   ObjectMapper objectMapper,
@@ -127,12 +131,10 @@ public class BybitFuturesConnector extends AbstractWebSocketConnector {
     @Override
     protected String buildSubscribeMessage(List<String> symbols) {
         List<String> args = new ArrayList<>();
-
         for (String symbol : symbols) {
-            args.add("orderbook.50." + symbol);
+            args.add("orderbook.200." + symbol);
             args.add("publicTrade." + symbol);
         }
-
         return String.format("{\"op\":\"subscribe\",\"args\":%s}", toJsonArray(args));
     }
 
@@ -158,26 +160,46 @@ public class BybitFuturesConnector extends AbstractWebSocketConnector {
         if (data == null) return;
 
         if (topic.startsWith("orderbook.")) {
-            handleOrderBook(data, topic);
+            String type = root.has("type") ? root.get("type").asText() : "snapshot";
+            handleOrderBook(data, topic, type);
         } else if (topic.startsWith("publicTrade.")) {
             handleTrade(data);
         }
     }
 
-    private void handleOrderBook(JsonNode data, String topic) {
+    private void handleOrderBook(JsonNode data, String topic, String type) {
         String symbol = data.get("s").asText();
+        long u = data.has("u") ? data.get("u").asLong() : 0;
+        long seq = data.has("seq") ? data.get("seq").asLong() : 0;
 
-        List<OrderBookLevel> bids = parseOrderBookLevels(data.get("b"));
-        List<OrderBookLevel> asks = parseOrderBookLevels(data.get("a"));
+        LocalOrderBook book = localBooks.computeIfAbsent(symbol, LocalOrderBook::new);
 
-        if (!bids.isEmpty() || !asks.isEmpty()) {
-            incrementOrderbookUpdates();
+        if ("snapshot".equals(type)) {
+            List<List<String>> bids = parseLevelsRaw(data.get("b"));
+            List<List<String>> asks = parseLevelsRaw(data.get("a"));
+            book.applySnapshot(bids, asks, u, seq);
+        } else if ("delta".equals(type)) {
+            if (!book.isInitialized()) {
+                return;
+            }
+            List<List<String>> bids = parseLevelsRaw(data.get("b"));
+            List<List<String>> asks = parseLevelsRaw(data.get("a"));
+            book.applyDelta(bids, asks, u, seq);
+        }
+
+        incrementOrderbookUpdates();
+        publishOrderBook(symbol, book);
+    }
+
+    private void publishOrderBook(String symbol, LocalOrderBook book) {
+        LocalOrderBook.Snapshot snapshot = book.getSnapshot();
+        if (!snapshot.bids().isEmpty() || !snapshot.asks().isEmpty()) {
             orderBookManager.updateOrderBook(
                     symbol,
                     Exchange.BYBIT,
                     MarketType.FUTURES,
-                    bids,
-                    asks,
+                    snapshot.bids(),
+                    snapshot.asks(),
                     null
             );
         }
@@ -188,7 +210,6 @@ public class BybitFuturesConnector extends AbstractWebSocketConnector {
             processSingleTrade(data);
             return;
         }
-
         for (JsonNode trade : data) {
             processSingleTrade(trade);
         }
@@ -210,20 +231,14 @@ public class BybitFuturesConnector extends AbstractWebSocketConnector {
         );
     }
 
-    private List<OrderBookLevel> parseOrderBookLevels(JsonNode levels) {
-        List<OrderBookLevel> result = new ArrayList<>();
+    private List<List<String>> parseLevelsRaw(JsonNode levels) {
+        List<List<String>> result = new ArrayList<>();
         if (levels == null || !levels.isArray()) {
             return result;
         }
-
         for (JsonNode level : levels) {
-            BigDecimal price = new BigDecimal(level.get(0).asText());
-            BigDecimal quantity = new BigDecimal(level.get(1).asText());
-            if (quantity.compareTo(BigDecimal.ZERO) > 0) {
-                result.add(new OrderBookLevel(price, quantity));
-            }
+            result.add(List.of(level.get(0).asText(), level.get(1).asText()));
         }
-
         return result;
     }
 

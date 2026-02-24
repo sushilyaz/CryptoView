@@ -275,30 +275,61 @@ record Alert(
 - [x] REST API для настроек (workspaces, densities, status)
 - [x] Density lifetime tracking
 - [x] WebSocket стрим densities для фронтенда
+- [x] Diff-based depth для Binance Spot/Futures (LocalOrderBook + REST snapshot)
+- [x] Diff-based depth для Bybit Spot/Futures (orderbook.200)
+- [x] Diff-based depth для OKX Spot/Futures (books, 400 уровней + ctVal)
+- [x] Diff-based depth для Bitget Spot/Futures (books, полная глубина)
 - [ ] Починить Gate (таймауты)
 - [ ] Добавить метрики (Micrometer)
 - [ ] Health checks для каждой биржи
 - [ ] Frontend на React
 
+## LocalOrderBook — diff-based управление стаканом
+
+Thread-safe класс для incremental обновлений ордербука. Используется всеми коннекторами кроме MEXC и Hyperliquid.
+
+### API
+- `applySnapshot(bids, asks, updateId)` — полная замена (Binance)
+- `applySnapshot(bids, asks, updateId, seqId)` — с seqId (Bybit, OKX, Bitget)
+- `applyDelta(bids, asks, updateId)` — инкрементальное обновление (Binance)
+- `applyDelta(bids, asks, updateId, seqId)` — с seqId (Bybit, OKX, Bitget)
+- `getSnapshot()` — получить текущий snapshot как `List<OrderBookLevel>`
+- `getSnapshot(quantityMultiplier)` — с множителем (OKX Futures ctVal)
+- `reset()` — сброс (при gap detection)
+
+### Формат данных
+Уровни передаются как `List<List<String>>` — `[[price, qty], ...]`. Qty=0 → удалить уровень.
+
 ## Известные особенности бирж
 
 ### Binance
 - Используем `/stream` (combined) вместо `/ws` (raw) — сообщения содержат имя стрима
-- `@depth20@500ms` — partial depth snapshot, 20 уровней
+- **Diff-based depth:** `@depth@100ms` (Spot) / `@depth@500ms` (Futures)
+- Требует REST snapshot для инициализации (`/api/v3/depth` Spot, `/fapi/v1/depth` Futures)
+- Event buffering до получения snapshot, gap detection по `U`/`pu`
 - Spot: `@trade`, Futures: `@aggTrade`
+- Лимит: 1024 стрима на соединение (512 символов × 2)
 
 ### Bybit
 - Unified API v5
-- `orderbook.50` для глубины стакана
+- **`orderbook.200`** — 200 уровней, incremental (snapshot + delta)
+- `type: "snapshot"` → первое сообщение, `type: "delta"` → последующие
+- Tracking: `u` (updateId), `seq` (sequence)
 
 ### OKX
-- `books5` — единственный канал без лимита подписок
-- `books50-l2-tbt` молча отбрасывает подписки при превышении лимита
+- **`books`** канал — 400 уровней, incremental (snapshot + update)
+- `action: "snapshot"` → первое сообщение, `action: "update"` → последующие
+- Tracking: `seqId`, `prevSeqId` для gap detection
+- REST fallback: `/api/v5/market/books?instId=X&sz=400`
+- **Futures ctVal:** `sz` = контракты, реальное количество = `sz × ctVal` (загружается из instruments API)
 - Подписки orderbook и trades отправляются **отдельными** WS-сообщениями
 
 ### Bitget
 - API v2: `wss://ws.bitget.com/v2/ws/public`
-- Канал `books15` (15 уровней). В handleMessage проверять именно `books15`
+- **`books`** канал — полная глубина, incremental (snapshot + update)
+- `action: "snapshot"` → первое сообщение, `action: "update"` → последующие
+- Tracking: `seq`, `pseq` (previous sequence) для gap detection
+- REST fallback: Spot `/api/v2/spot/market/orderbook`, Futures `/api/v2/mix/market/merge-depth`
 
 ### Hyperliquid
 - Только USDC пары, perpetual DEX
@@ -307,7 +338,8 @@ record Alert(
 
 ### MEXC
 - Только Spot мониторим
-- Protobuf формат + WebSocket connection pool
+- Protobuf формат + WebSocket connection pool (15 символов / соединение)
+- URL: `wss://wbs-api.mexc.com/ws`
 - Глубина до 20 уровней
 - Медленная загрузка символов (много пар)
 
@@ -337,7 +369,7 @@ com.cryptoview
 │   ├── config            # GlobalConfig, ExchangeConfig, MarketTypeConfig, SymbolConfig, EffectiveConfig, ExchangeMarketKey, Workspace
 │   └── dto               # DensityResponse, WorkspaceRequest
 ├── exchange
-│   ├── common            # ExchangeConnector (interface), AbstractWebSocketConnector
+│   ├── common            # ExchangeConnector (interface), AbstractWebSocketConnector, LocalOrderBook
 │   ├── ExchangeManager   # Управление всеми коннекторами
 │   ├── binance/          # BinanceSpotConnector, BinanceFuturesConnector
 │   ├── bybit/            # BybitSpotConnector, BybitFuturesConnector

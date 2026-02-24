@@ -1,7 +1,7 @@
 package com.cryptoview.exchange.okx;
 
 import com.cryptoview.exchange.common.AbstractWebSocketConnector;
-import com.cryptoview.model.domain.OrderBookLevel;
+import com.cryptoview.exchange.common.LocalOrderBook;
 import com.cryptoview.model.enums.Exchange;
 import com.cryptoview.model.enums.MarketType;
 import com.cryptoview.service.orderbook.OrderBookManager;
@@ -18,7 +18,8 @@ import java.io.IOException;
 import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.stream.Collectors;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 @Slf4j
 @Component
@@ -26,6 +27,9 @@ public class OkxSpotConnector extends AbstractWebSocketConnector {
 
     private static final String WS_URL = "wss://ws.okx.com:8443/ws/v5/public";
     private static final String REST_URL = "https://www.okx.com/api/v5/public/instruments?instType=SPOT";
+    private static final String DEPTH_SNAPSHOT_URL = "https://www.okx.com/api/v5/market/books";
+
+    private final Map<String, LocalOrderBook> localBooks = new ConcurrentHashMap<>();
 
     public OkxSpotConnector(OkHttpClient httpClient,
                              ObjectMapper objectMapper,
@@ -81,9 +85,7 @@ public class OkxSpotConnector extends AbstractWebSocketConnector {
     }
 
     private List<String> fetchAllSymbols() {
-        Request request = new Request.Builder()
-                .url(REST_URL)
-                .build();
+        Request request = new Request.Builder().url(REST_URL).build();
 
         try (Response response = executeWithRetry(request, 3, 5000)) {
             if (response.body() != null) {
@@ -120,7 +122,8 @@ public class OkxSpotConnector extends AbstractWebSocketConnector {
             return;
         }
 
-        String bookMsg = buildSubscribeForChannel(symbols, "books5");
+        // Subscribe to books (400 levels, incremental) and trades separately
+        String bookMsg = buildSubscribeForChannel(symbols, "books");
         webSocket.send(bookMsg);
 
         try { Thread.sleep(100); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
@@ -134,7 +137,7 @@ public class OkxSpotConnector extends AbstractWebSocketConnector {
 
     @Override
     protected String buildSubscribeMessage(List<String> symbols) {
-        return buildSubscribeForChannel(symbols, "books5");
+        return buildSubscribeForChannel(symbols, "books");
     }
 
     private String buildSubscribeForChannel(List<String> symbols, String channel) {
@@ -150,7 +153,6 @@ public class OkxSpotConnector extends AbstractWebSocketConnector {
         JsonNode root = parseJson(message);
         if (root == null) return;
 
-        // Пропускаем служебные сообщения
         if (root.has("event")) {
             return;
         }
@@ -165,28 +167,80 @@ public class OkxSpotConnector extends AbstractWebSocketConnector {
         String channel = arg.get("channel").asText();
         String instId = arg.get("instId").asText();
 
-        if ("books5".equals(channel)) {
-            handleOrderBook(data.get(0), instId);
+        if ("books".equals(channel)) {
+            String action = root.has("action") ? root.get("action").asText() : "snapshot";
+            handleOrderBook(data.get(0), instId, action);
         } else if ("trades".equals(channel)) {
             handleTrades(data);
         }
     }
 
-    private void handleOrderBook(JsonNode data, String instId) {
-        List<OrderBookLevel> bids = parseOrderBookLevels(data.get("bids"));
-        List<OrderBookLevel> asks = parseOrderBookLevels(data.get("asks"));
-
-        // OKX instId format: BTC-USDT -> BTCUSDT
+    private void handleOrderBook(JsonNode data, String instId, String action) {
         String symbol = instId.replace("-", "");
+        LocalOrderBook book = localBooks.computeIfAbsent(symbol, LocalOrderBook::new);
 
-        if (!bids.isEmpty() || !asks.isEmpty()) {
-            incrementOrderbookUpdates();
+        long seqId = data.has("seqId") ? data.get("seqId").asLong() : 0;
+        long prevSeqId = data.has("prevSeqId") ? data.get("prevSeqId").asLong() : 0;
+
+        if ("snapshot".equals(action)) {
+            List<List<String>> bids = parseLevelsRaw(data.get("bids"));
+            List<List<String>> asks = parseLevelsRaw(data.get("asks"));
+            book.applySnapshot(bids, asks, 0, seqId);
+        } else if ("update".equals(action)) {
+            if (!book.isInitialized()) {
+                return;
+            }
+
+            // Verify sequence continuity
+            if (prevSeqId != 0 && prevSeqId != book.getLastSeqId()) {
+                log.warn("[OKX:SPOT] Seq gap for {} (prevSeqId={}, lastSeqId={}), fetching REST snapshot",
+                        symbol, prevSeqId, book.getLastSeqId());
+                fetchRestSnapshot(instId, book);
+                return;
+            }
+
+            List<List<String>> bids = parseLevelsRaw(data.get("bids"));
+            List<List<String>> asks = parseLevelsRaw(data.get("asks"));
+            book.applyDelta(bids, asks, 0, seqId);
+        }
+
+        incrementOrderbookUpdates();
+        publishOrderBook(symbol, book);
+    }
+
+    private void fetchRestSnapshot(String instId, LocalOrderBook book) {
+        Thread.startVirtualThread(() -> {
+            String url = DEPTH_SNAPSHOT_URL + "?instId=" + instId + "&sz=400";
+            Request request = new Request.Builder().url(url).build();
+
+            try (Response response = executeWithRetry(request, 3, 5000)) {
+                if (response.body() != null) {
+                    JsonNode root = objectMapper.readTree(response.body().string());
+                    JsonNode data = root.get("data");
+                    if (data != null && data.isArray() && !data.isEmpty()) {
+                        JsonNode bookData = data.get(0);
+                        long seqId = bookData.has("seqId") ? bookData.get("seqId").asLong() : 0;
+                        List<List<String>> bids = parseLevelsRaw(bookData.get("bids"));
+                        List<List<String>> asks = parseLevelsRaw(bookData.get("asks"));
+                        book.applySnapshot(bids, asks, 0, seqId);
+                        log.info("[OKX:SPOT] REST snapshot restored for {}", instId);
+                    }
+                }
+            } catch (IOException e) {
+                log.error("[OKX:SPOT] Failed to fetch REST snapshot for {}", instId, e);
+            }
+        });
+    }
+
+    private void publishOrderBook(String symbol, LocalOrderBook book) {
+        LocalOrderBook.Snapshot snapshot = book.getSnapshot();
+        if (!snapshot.bids().isEmpty() || !snapshot.asks().isEmpty()) {
             orderBookManager.updateOrderBook(
                     symbol,
                     Exchange.OKX,
                     MarketType.SPOT,
-                    bids,
-                    asks,
+                    snapshot.bids(),
+                    snapshot.asks(),
                     null
             );
         }
@@ -211,20 +265,15 @@ public class OkxSpotConnector extends AbstractWebSocketConnector {
         }
     }
 
-    private List<OrderBookLevel> parseOrderBookLevels(JsonNode levels) {
-        List<OrderBookLevel> result = new ArrayList<>();
+    private List<List<String>> parseLevelsRaw(JsonNode levels) {
+        List<List<String>> result = new ArrayList<>();
         if (levels == null || !levels.isArray()) {
             return result;
         }
-
         for (JsonNode level : levels) {
-            BigDecimal price = new BigDecimal(level.get(0).asText());
-            BigDecimal quantity = new BigDecimal(level.get(1).asText());
-            if (quantity.compareTo(BigDecimal.ZERO) > 0) {
-                result.add(new OrderBookLevel(price, quantity));
-            }
+            // OKX format: [price, qty, deprecated, numOrders]
+            result.add(List.of(level.get(0).asText(), level.get(1).asText()));
         }
-
         return result;
     }
 

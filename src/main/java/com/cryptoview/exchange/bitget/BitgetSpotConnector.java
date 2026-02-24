@@ -1,7 +1,7 @@
 package com.cryptoview.exchange.bitget;
 
 import com.cryptoview.exchange.common.AbstractWebSocketConnector;
-import com.cryptoview.model.domain.OrderBookLevel;
+import com.cryptoview.exchange.common.LocalOrderBook;
 import com.cryptoview.model.enums.Exchange;
 import com.cryptoview.model.enums.MarketType;
 import com.cryptoview.service.orderbook.OrderBookManager;
@@ -18,6 +18,8 @@ import java.io.IOException;
 import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 @Slf4j
 @Component
@@ -25,6 +27,9 @@ public class BitgetSpotConnector extends AbstractWebSocketConnector {
 
     private static final String WS_URL = "wss://ws.bitget.com/v2/ws/public";
     private static final String REST_URL = "https://api.bitget.com/api/v2/spot/public/symbols";
+    private static final String DEPTH_SNAPSHOT_URL = "https://api.bitget.com/api/v2/spot/market/orderbook";
+
+    private final Map<String, LocalOrderBook> localBooks = new ConcurrentHashMap<>();
 
     public BitgetSpotConnector(OkHttpClient httpClient,
                                 ObjectMapper objectMapper,
@@ -80,9 +85,7 @@ public class BitgetSpotConnector extends AbstractWebSocketConnector {
     }
 
     private List<String> fetchAllSymbols() {
-        Request request = new Request.Builder()
-                .url(REST_URL)
-                .build();
+        Request request = new Request.Builder().url(REST_URL).build();
 
         try (Response response = executeWithRetry(request, 3, 5000)) {
             if (response.body() != null) {
@@ -115,12 +118,10 @@ public class BitgetSpotConnector extends AbstractWebSocketConnector {
     @Override
     protected String buildSubscribeMessage(List<String> symbols) {
         List<String> args = new ArrayList<>();
-
         for (String symbol : symbols) {
-            args.add(String.format("{\"instType\":\"SPOT\",\"channel\":\"books15\",\"instId\":\"%s\"}", symbol));
+            args.add(String.format("{\"instType\":\"SPOT\",\"channel\":\"books\",\"instId\":\"%s\"}", symbol));
             args.add(String.format("{\"instType\":\"SPOT\",\"channel\":\"trade\",\"instId\":\"%s\"}", symbol));
         }
-
         return String.format("{\"op\":\"subscribe\",\"args\":[%s]}", String.join(",", args));
     }
 
@@ -129,12 +130,10 @@ public class BitgetSpotConnector extends AbstractWebSocketConnector {
         JsonNode root = parseJson(message);
         if (root == null) return;
 
-        // Пропускаем служебные сообщения
         if (root.has("event")) {
             return;
         }
 
-        String action = root.has("action") ? root.get("action").asText() : null;
         JsonNode arg = root.get("arg");
         JsonNode data = root.get("data");
 
@@ -145,30 +144,81 @@ public class BitgetSpotConnector extends AbstractWebSocketConnector {
         String channel = arg.get("channel").asText();
         String instId = arg.get("instId").asText();
 
-        if ("books15".equals(channel)) {
-            handleOrderBook(data, instId);
+        if ("books".equals(channel)) {
+            String action = root.has("action") ? root.get("action").asText() : "snapshot";
+            handleOrderBook(data, instId, action);
         } else if ("trade".equals(channel)) {
             handleTrades(data, instId);
         }
     }
 
-    private void handleOrderBook(JsonNode data, String instId) {
+    private void handleOrderBook(JsonNode data, String instId, String action) {
         if (!data.isArray() || data.isEmpty()) {
             return;
         }
 
-        JsonNode book = data.get(0);
-        List<OrderBookLevel> bids = parseOrderBookLevels(book.get("bids"));
-        List<OrderBookLevel> asks = parseOrderBookLevels(book.get("asks"));
+        JsonNode bookData = data.get(0);
+        LocalOrderBook book = localBooks.computeIfAbsent(instId, LocalOrderBook::new);
 
-        if (!bids.isEmpty() || !asks.isEmpty()) {
-            incrementOrderbookUpdates();
+        long seq = bookData.has("seq") ? bookData.get("seq").asLong() : 0;
+        long pseq = bookData.has("pseq") ? bookData.get("pseq").asLong() : 0;
+
+        if ("snapshot".equals(action)) {
+            List<List<String>> bids = parseLevelsRaw(bookData.get("bids"));
+            List<List<String>> asks = parseLevelsRaw(bookData.get("asks"));
+            book.applySnapshot(bids, asks, 0, seq);
+        } else if ("update".equals(action)) {
+            if (!book.isInitialized()) {
+                return;
+            }
+
+            if (pseq != 0 && pseq != book.getLastSeqId()) {
+                log.warn("[BITGET:SPOT] Seq gap for {} (pseq={}, lastSeq={}), fetching REST snapshot",
+                        instId, pseq, book.getLastSeqId());
+                fetchRestSnapshot(instId, book);
+                return;
+            }
+
+            List<List<String>> bids = parseLevelsRaw(bookData.get("bids"));
+            List<List<String>> asks = parseLevelsRaw(bookData.get("asks"));
+            book.applyDelta(bids, asks, 0, seq);
+        }
+
+        incrementOrderbookUpdates();
+        publishOrderBook(instId, book);
+    }
+
+    private void fetchRestSnapshot(String instId, LocalOrderBook book) {
+        Thread.startVirtualThread(() -> {
+            String url = DEPTH_SNAPSHOT_URL + "?symbol=" + instId + "&type=step0&limit=150";
+            Request request = new Request.Builder().url(url).build();
+
+            try (Response response = executeWithRetry(request, 3, 5000)) {
+                if (response.body() != null) {
+                    JsonNode root = objectMapper.readTree(response.body().string());
+                    JsonNode data = root.get("data");
+                    if (data != null) {
+                        List<List<String>> bids = parseLevelsRaw(data.get("bids"));
+                        List<List<String>> asks = parseLevelsRaw(data.get("asks"));
+                        book.applySnapshot(bids, asks, 0, 0);
+                        log.info("[BITGET:SPOT] REST snapshot restored for {}", instId);
+                    }
+                }
+            } catch (IOException e) {
+                log.error("[BITGET:SPOT] Failed to fetch REST snapshot for {}", instId, e);
+            }
+        });
+    }
+
+    private void publishOrderBook(String symbol, LocalOrderBook book) {
+        LocalOrderBook.Snapshot snapshot = book.getSnapshot();
+        if (!snapshot.bids().isEmpty() || !snapshot.asks().isEmpty()) {
             orderBookManager.updateOrderBook(
-                    instId,
+                    symbol,
                     Exchange.BITGET,
                     MarketType.SPOT,
-                    bids,
-                    asks,
+                    snapshot.bids(),
+                    snapshot.asks(),
                     null
             );
         }
@@ -195,20 +245,14 @@ public class BitgetSpotConnector extends AbstractWebSocketConnector {
         }
     }
 
-    private List<OrderBookLevel> parseOrderBookLevels(JsonNode levels) {
-        List<OrderBookLevel> result = new ArrayList<>();
+    private List<List<String>> parseLevelsRaw(JsonNode levels) {
+        List<List<String>> result = new ArrayList<>();
         if (levels == null || !levels.isArray()) {
             return result;
         }
-
         for (JsonNode level : levels) {
-            BigDecimal price = new BigDecimal(level.get(0).asText());
-            BigDecimal quantity = new BigDecimal(level.get(1).asText());
-            if (quantity.compareTo(BigDecimal.ZERO) > 0) {
-                result.add(new OrderBookLevel(price, quantity));
-            }
+            result.add(List.of(level.get(0).asText(), level.get(1).asText()));
         }
-
         return result;
     }
 

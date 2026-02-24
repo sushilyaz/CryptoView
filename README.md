@@ -26,7 +26,7 @@ CryptoView отслеживает стаканы (orderbook) на 7 крипто
 
 ### Ключевые возможности
 
-- **Real-time мониторинг:** WebSocket подключение ко всем биржам, обработка до 50,000 msg/sec
+- **Real-time мониторинг:** WebSocket подключение ко всем биржам, diff-based incremental depth (до 400 уровней), обработка до 50,000 msg/sec
 - **Два pipeline:** Telegram-алерты + density tracking для фронтенда (независимые)
 - **Density Lifetime Tracking:** отслеживание времени жизни плотностей (firstSeenAt/lastSeenAt), порог $50K
 - **Workspaces:** пресеты фильтрации (blacklist, min density overrides, комментарии, сортировка)
@@ -287,7 +287,7 @@ src/main/java/com/cryptoview/
 │   ├── config/            # GlobalConfig, ExchangeConfig, Workspace, ExchangeMarketKey, ...
 │   └── dto/               # DensityResponse, WorkspaceRequest
 ├── exchange/              # Биржевые коннекторы
-│   ├── common/            # ExchangeConnector, AbstractWebSocketConnector
+│   ├── common/            # ExchangeConnector, AbstractWebSocketConnector, LocalOrderBook
 │   ├── ExchangeManager    # Управление коннекторами
 │   ├── binance/           # Spot + Futures
 │   ├── bybit/             # Spot + Futures
