@@ -101,21 +101,23 @@ public class BinanceFuturesConnector extends AbstractWebSocketConnector {
     private void fetchSnapshotsForAll(List<String> symbols) {
         log.info("[BINANCE:FUTURES] Fetching depth snapshots for {} symbols...", symbols.size());
         int count = 0;
+        int failed = 0;
         for (String symbol : symbols) {
             try {
                 fetchAndApplySnapshot(symbol);
                 count++;
-                // Rate limit: limit=1000 costs 20 weight, IP limit is 2400/min for futures
-                // ~120 requests/min. Be conservative: 1 per second
+                // limit=1000 costs 20 weight, IP limit 2400/min → up to 120 req/min.
+                // 1 request per second — safe margin.
                 Thread.sleep(1000);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 break;
             } catch (Exception e) {
+                failed++;
                 log.warn("[BINANCE:FUTURES] Failed to fetch snapshot for {}: {}", symbol, e.getMessage());
             }
         }
-        log.info("[BINANCE:FUTURES] Fetched {} of {} snapshots", count, symbols.size());
+        log.info("[BINANCE:FUTURES] Snapshots done: {}/{} fetched, {} failed", count, symbols.size(), failed);
     }
 
     private void fetchAndApplySnapshot(String symbol) {
@@ -286,13 +288,12 @@ public class BinanceFuturesConnector extends AbstractWebSocketConnector {
 
         LocalOrderBook book = localBooks.get(symbol);
         if (book == null || !book.isInitialized()) {
+            // Not yet initialized — just buffer the event.
+            // fetchSnapshotsForAll() will get to this symbol in due course.
             eventBuffers.putIfAbsent(symbol, new CopyOnWriteArrayList<>());
             CopyOnWriteArrayList<JsonNode> buffer = eventBuffers.get(symbol);
             if (buffer != null) {
                 buffer.add(data);
-            }
-            if (!initializing.containsKey(symbol)) {
-                Thread.startVirtualThread(() -> fetchAndApplySnapshot(symbol));
             }
             return;
         }
@@ -306,7 +307,12 @@ public class BinanceFuturesConnector extends AbstractWebSocketConnector {
             log.warn("[BINANCE:FUTURES] Gap for {} (pu={}, lastUpdateId={}), re-initializing",
                     symbol, pu, book.getLastUpdateId());
             book.reset();
-            Thread.startVirtualThread(() -> fetchAndApplySnapshot(symbol));
+            // Re-queue for re-fetch with a short delay to avoid burst
+            eventBuffers.putIfAbsent(symbol, new CopyOnWriteArrayList<>());
+            Thread.startVirtualThread(() -> {
+                try { Thread.sleep(1000); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
+                fetchAndApplySnapshot(symbol);
+            });
             return;
         }
 

@@ -31,7 +31,7 @@ public class BinanceSpotConnector extends AbstractWebSocketConnector {
     private static final String WS_URL = "wss://stream.binance.com:9443/stream";
     private static final String REST_URL = "https://api.binance.com/api/v3/exchangeInfo";
     private static final String DEPTH_SNAPSHOT_URL = "https://api.binance.com/api/v3/depth";
-    private static final int SNAPSHOT_LIMIT = 5000;
+    private static final int SNAPSHOT_LIMIT = 1000;
 
     // Local orderbooks for diff-based depth management
     private final Map<String, LocalOrderBook> localBooks = new ConcurrentHashMap<>();
@@ -107,21 +107,23 @@ public class BinanceSpotConnector extends AbstractWebSocketConnector {
     private void fetchSnapshotsForAll(List<String> symbols) {
         log.info("[BINANCE:SPOT] Fetching depth snapshots for {} symbols...", symbols.size());
         int count = 0;
+        int failed = 0;
         for (String symbol : symbols) {
             try {
                 fetchAndApplySnapshot(symbol);
                 count++;
-                // Rate limit: limit=5000 costs 250 weight, IP limit is 6000/min
-                // So ~24 requests/min max. Be conservative: 1 per 3 seconds
-                Thread.sleep(3000);
+                // limit=1000 costs 100 weight, IP limit 6000/min → 60 req/min max.
+                // 1 request per second — safe margin.
+                Thread.sleep(1000);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 break;
             } catch (Exception e) {
+                failed++;
                 log.warn("[BINANCE:SPOT] Failed to fetch snapshot for {}: {}", symbol, e.getMessage());
             }
         }
-        log.info("[BINANCE:SPOT] Fetched {} of {} snapshots", count, symbols.size());
+        log.info("[BINANCE:SPOT] Snapshots done: {}/{} fetched, {} failed", count, symbols.size(), failed);
     }
 
     private void fetchAndApplySnapshot(String symbol) {
@@ -296,14 +298,12 @@ public class BinanceSpotConnector extends AbstractWebSocketConnector {
 
         LocalOrderBook book = localBooks.get(symbol);
         if (book == null || !book.isInitialized()) {
-            // Not yet initialized — buffer event and trigger snapshot fetch
+            // Not yet initialized — just buffer the event.
+            // fetchSnapshotsForAll() will get to this symbol in due course.
             eventBuffers.putIfAbsent(symbol, new CopyOnWriteArrayList<>());
             CopyOnWriteArrayList<JsonNode> buffer = eventBuffers.get(symbol);
             if (buffer != null) {
                 buffer.add(data);
-            }
-            if (!initializing.containsKey(symbol)) {
-                Thread.startVirtualThread(() -> fetchAndApplySnapshot(symbol));
             }
             return;
         }
@@ -316,7 +316,12 @@ public class BinanceSpotConnector extends AbstractWebSocketConnector {
             log.warn("[BINANCE:SPOT] Gap detected for {} (U={}, lastUpdateId={}), re-initializing",
                     symbol, U, book.getLastUpdateId());
             book.reset();
-            Thread.startVirtualThread(() -> fetchAndApplySnapshot(symbol));
+            // Re-queue this symbol for re-fetch in the sequential background fetcher
+            eventBuffers.putIfAbsent(symbol, new CopyOnWriteArrayList<>());
+            Thread.startVirtualThread(() -> {
+                try { Thread.sleep(1000); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
+                fetchAndApplySnapshot(symbol);
+            });
             return;
         }
 
