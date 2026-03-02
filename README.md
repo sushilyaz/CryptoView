@@ -26,21 +26,27 @@ CryptoView отслеживает стаканы (orderbook) на 7 крипто
 
 ### Ключевые возможности
 
-- **Real-time мониторинг:** WebSocket подключение ко всем биржам, diff-based incremental depth (до 400 уровней), обработка до 50,000 msg/sec
+- **Real-time мониторинг:** WebSocket подключение ко всем биржам, diff-based incremental depth (до 400 уровней)
 - **Два pipeline:** Telegram-алерты + density tracking для фронтенда (независимые)
 - **Density Lifetime Tracking:** отслеживание времени жизни плотностей (firstSeenAt/lastSeenAt), порог $50K
-- **Workspaces:** пресеты фильтрации (blacklist, min density overrides, комментарии, сортировка)
-- **REST API:** CRUD workspaces, densities с фильтрацией, настройки символов, статус системы
+- **Workspaces:** пресеты фильтрации (blacklist, избранное, min density overrides, комментарии, сортировка)
+- **REST API:** CRUD workspaces, densities с фильтрацией, настройки символов, export/import, статус системы
 - **WebSocket стрим:** `/ws/densities` — broadcast отфильтрованных плотностей каждые 500мс
+- **React Frontend:** тёмный UI с карточками монет, real-time обновление, настройки workspace
 - **Умная дедупликация:** max 4 алерта на символ (по side + alertType), cooldown 5 мин
 - **Telegram rate limiter:** очередь сообщений (~20 msg/sec), retry при 429
 - **Автореконнект:** exponential backoff (до 10 попыток), ping/pong (30s), stale detection (90s)
 
 ## Требования
 
+### Бэкенд
 - Java 21+
 - Gradle 8+
 - Telegram Bot Token (для алертов)
+
+### Фронтенд
+- Node.js 18+ (проверено на v24)
+- npm 9+
 
 ## Быстрый старт
 
@@ -60,31 +66,21 @@ TELEGRAM_CHAT_ID=your_chat_id
 TELEGRAM_ENABLED=true
 ```
 
-Или настройте `application.yml`:
-
-```yaml
-cryptoview:
-  telegram:
-    bot-token: ${TELEGRAM_BOT_TOKEN}
-    chat-ids:
-      - ${TELEGRAM_CHAT_ID}
-    enabled: ${TELEGRAM_ENABLED:false}
-
-  global:
-    min-density-usd: 100000
-    cooldown-minutes: 5
-    max-distance-percent: 10.0
-    alert-types:
-      - VOLUME_BASED
-      - STATISTICAL
-```
-
-### 3. Запуск
+### 3. Запуск бэкенда
 ```bash
 ./gradlew bootRun
 ```
+Бэкенд стартует на `http://localhost:8080`.
 
-### 4. Проверка
+### 4. Запуск фронтенда
+```bash
+cd frontend
+npm install   # только в первый раз
+npm run dev
+```
+Фронтенд стартует на `http://localhost:3000`. Запросы к `/api` и `/ws` автоматически проксируются на бэкенд.
+
+### 5. Проверка
 ```bash
 # Статус системы
 curl http://localhost:8080/api/v1/status
@@ -98,7 +94,7 @@ curl http://localhost:8080/api/v1/workspaces
 
 ## Конфигурация
 
-### Иерархия настроек
+### Иерархия настроек (бэкенд)
 
 Настройки применяются в порядке приоритета (первое найденное не-null):
 1. **Монета** — `symbols-config.json` (высший приоритет)
@@ -147,6 +143,8 @@ cryptoview:
 | PUT | `/api/v1/workspaces/{id}` | Обновить workspace |
 | DELETE | `/api/v1/workspaces/{id}` | Удалить (нельзя активный) |
 | POST | `/api/v1/workspaces/{id}/activate` | Активировать |
+| GET | `/api/v1/workspaces/{id}/export` | Экспортировать как JSON |
+| POST | `/api/v1/workspaces/import` | Импортировать из JSON |
 
 ### Densities
 | Method | Path | Query Params | Описание |
@@ -236,77 +234,63 @@ ws://localhost:8080/ws/densities?workspaceId=<uuid>
 │ (in-memory storage)  │  │ (15-min sliding win) │
 └──────────┬───────────┘  └──────────┬──────────┘
            │                         │
-           ▼                         │
-┌──────────────────────┐             │
-│   Anomaly Detector   │◄────────────┘
-│ (Z-score, IQR, Vol.) │
-└──────────┬───────────┘
-           │ DensityDetectedEvent        ┌──────────────────────┐
-           ▼                             │   Density Tracker     │
-┌──────────────────────┐                 │  (lifetime tracking)  │
-│    Alert Service     │                 │  ConcurrentHashMap    │
-│ (dedup, cooldown)    │                 └──────────┬───────────┘
-└──────────┬───────────┘                            │
-           │ AlertEvent                             ▼
-           ▼                             ┌──────────────────────┐
-┌──────────────────────┐                 │ DensityFilterService  │
-│   Telegram Service   │                 │ (workspace filtering) │
-│  (rate-limited send) │                 └────┬────────────┬────┘
-└──────────────────────┘                      │            │
-                                              ▼            ▼
-                                      REST /densities   WS /ws/densities
-                                                        (500ms broadcast)
+           ├─────────────────────────┤
+           │                         │
+           ▼                         ▼
+┌──────────────────────┐  ┌──────────────────────┐
+│   Anomaly Detector   │  │   Density Tracker    │
+│ (Z-score, IQR, Vol.) │  │  (lifetime tracking) │
+└──────────┬───────────┘  └──────────┬───────────┘
+           │ DensityDetectedEvent     │
+           ▼                         ▼
+┌──────────────────────┐  ┌──────────────────────┐
+│    Alert Service     │  │ DensityFilterService  │
+│ (dedup, cooldown)    │  │ (workspace filtering) │
+└──────────┬───────────┘  └────┬────────────┬────┘
+           │ AlertEvent         │            │
+           ▼                   ▼            ▼
+┌──────────────────────┐  REST /densities  WS /ws/densities
+│   Telegram Service   │                   (500ms broadcast)
+│  (rate-limited send) │                        │
+└──────────────────────┘                        ▼
+                                       ┌──────────────────┐
+                                       │  React Frontend   │
+                                       │ (localhost:3000)  │
+                                       └──────────────────┘
 ```
 
 **Два независимых pipeline:**
-1. **Alert pipeline** (левая часть) — для Telegram-алертов. Используется AnomalyDetector с порогами из application.yml.
-2. **Density tracking pipeline** (правая часть) — для фронтенда. Отслеживает все плотности >$50K, фильтрует по workspace.
+1. **Alert pipeline** — для Telegram-алертов. Использует AnomalyDetector с порогами из application.yml.
+2. **Density tracking pipeline** — для фронтенда. Отслеживает все плотности >$50K, фильтрует по workspace.
 
-Workspaces НЕ влияют на alert pipeline. Они фильтруют только то, что видит фронтенд.
+Workspaces НЕ влияют на alert pipeline.
 
 ## Структура проекта
 
 ```
-src/main/java/com/cryptoview/
-├── config/                # Конфигурация
-│   ├── AsyncConfig        # ThreadPool (4-16 threads)
-│   ├── CryptoViewProperties  # application.yml binding
-│   ├── JacksonConfig      # JSON (JavaTimeModule, ISO-8601)
-│   ├── OkHttpConfig       # OkHttp для бирж
-│   ├── WebConfig          # CORS (localhost:3000)
-│   └── WebSocketConfig    # WS endpoint /ws/densities
-├── controller/            # REST + WebSocket
-│   ├── DensityController  # GET /api/v1/densities
-│   ├── DensityWebSocketHandler  # WS стрим (500мс broadcast)
-│   ├── WorkspaceController     # CRUD workspaces
-│   ├── SymbolController   # Blacklist, comments, min-density
-│   └── StatusController   # GET /api/v1/status
-├── model/
-│   ├── domain/            # OrderBook, Density, Alert, Trade, TrackedDensity
-│   ├── enums/             # Exchange, MarketType, AlertType, Side, DensitySortType
-│   ├── config/            # GlobalConfig, ExchangeConfig, Workspace, ExchangeMarketKey, ...
-│   └── dto/               # DensityResponse, WorkspaceRequest
-├── exchange/              # Биржевые коннекторы
-│   ├── common/            # ExchangeConnector, AbstractWebSocketConnector, LocalOrderBook
-│   ├── ExchangeManager    # Управление коннекторами
-│   ├── binance/           # Spot + Futures
-│   ├── bybit/             # Spot + Futures
-│   ├── okx/               # Spot + Futures
-│   ├── bitget/            # Spot + Futures
-│   ├── gate/              # Disabled
-│   ├── mexc/              # Spot only (protobuf)
-│   ├── hyperliquid/       # Futures only (USDC DEX)
-│   └── lighter/           # Disabled
-├── service/
-│   ├── config/            # ConfigService (hierarchical config)
-│   ├── orderbook/         # OrderBookManager (in-memory)
-│   ├── volume/            # VolumeTracker (15-min window)
-│   ├── detector/          # AnomalyDetector (Z-score, IQR)
-│   ├── alert/             # AlertService (Density → Alert)
-│   ├── telegram/          # TelegramService (rate-limited)
-│   ├── density/           # DensityTracker + DensityFilterService
-│   └── workspace/         # WorkspaceService (CRUD + JSON)
-└── event/                 # Spring Events
+CryptoView/
+├── src/                          # Бэкенд (Spring Boot)
+│   └── main/java/com/cryptoview/
+│       ├── config/               # Spring конфигурация
+│       ├── controller/           # REST + WebSocket контроллеры
+│       ├── exchange/             # Биржевые коннекторы (14 классов)
+│       ├── model/                # Domain objects, DTO, enums
+│       ├── service/              # Бизнес-логика
+│       └── event/                # Spring Events
+├── frontend/                     # Фронтенд (React + TypeScript)
+│   ├── src/
+│   │   ├── api/                  # REST и WebSocket клиенты
+│   │   ├── stores/               # Zustand state management
+│   │   ├── components/           # React компоненты
+│   │   ├── hooks/                # Кастомные хуки
+│   │   ├── types/                # TypeScript типы
+│   │   └── utils/                # Форматеры, константы
+│   ├── public/icons/             # SVG иконки бирж
+│   └── vite.config.ts            # Proxy: /api, /ws → localhost:8080
+├── workspaces.json               # Persisted workspaces (auto-generated)
+├── symbols-config.json           # Настройки символов для alert pipeline
+├── CLAUDE.md                     # Контекст для разработки (этот файл)
+└── README.md                     # Документация
 ```
 
 ## Производительность

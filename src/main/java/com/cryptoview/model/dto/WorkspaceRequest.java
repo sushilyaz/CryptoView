@@ -12,7 +12,9 @@ public record WorkspaceRequest(
         Map<String, BigDecimal> minDensityOverrides,
         Map<String, BigDecimal> symbolMinDensityOverrides,
         Set<String> blacklistedSymbols,
+        Set<String> favoritedSymbols,
         Map<String, String> symbolComments,
-        DensitySortType sortType
+        DensitySortType sortType,
+        Integer newBadgeDurationMinutes
 ) {
 }

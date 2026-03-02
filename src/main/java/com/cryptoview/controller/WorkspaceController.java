@@ -60,13 +60,27 @@ public class WorkspaceController {
                 .orElse(ResponseEntity.notFound().build());
     }
 
+    @GetMapping("/{id}/export")
+    public ResponseEntity<Workspace> exportWorkspace(@PathVariable String id) {
+        return workspaceService.getWorkspace(id)
+                .map(ResponseEntity::ok)
+                .orElse(ResponseEntity.notFound().build());
+    }
+
+    @PostMapping("/import")
+    public Workspace importWorkspace(@RequestBody Workspace workspace) {
+        return workspaceService.importWorkspace(workspace);
+    }
+
     private void applyRequest(Workspace ws, WorkspaceRequest request) {
         if (request.name() != null) ws.setName(request.name());
         if (request.enabledMarkets() != null) ws.setEnabledMarkets(request.enabledMarkets());
         if (request.minDensityOverrides() != null) ws.setMinDensityOverrides(request.minDensityOverrides());
         if (request.symbolMinDensityOverrides() != null) ws.setSymbolMinDensityOverrides(request.symbolMinDensityOverrides());
         if (request.blacklistedSymbols() != null) ws.setBlacklistedSymbols(request.blacklistedSymbols());
+        if (request.favoritedSymbols() != null) ws.setFavoritedSymbols(request.favoritedSymbols());
         if (request.symbolComments() != null) ws.setSymbolComments(request.symbolComments());
         if (request.sortType() != null) ws.setSortType(request.sortType());
+        if (request.newBadgeDurationMinutes() != null) ws.setNewBadgeDurationMinutes(request.newBadgeDurationMinutes());
     }
 }

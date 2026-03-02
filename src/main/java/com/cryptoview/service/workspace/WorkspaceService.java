@@ -82,8 +82,10 @@ public class WorkspaceService {
         existing.setMinDensityOverrides(updated.getMinDensityOverrides());
         existing.setSymbolMinDensityOverrides(updated.getSymbolMinDensityOverrides());
         existing.setBlacklistedSymbols(updated.getBlacklistedSymbols());
+        existing.setFavoritedSymbols(updated.getFavoritedSymbols());
         existing.setSymbolComments(updated.getSymbolComments());
         existing.setSortType(updated.getSortType());
+        existing.setNewBadgeDurationMinutes(updated.getNewBadgeDurationMinutes());
 
         saveToFile();
         return Optional.of(existing);
@@ -154,6 +156,16 @@ public class WorkspaceService {
         ws.getSymbolMinDensityOverrides().put(symbol.toUpperCase(), minDensity);
         saveToFile();
         return Optional.of(ws);
+    }
+
+    public Workspace importWorkspace(Workspace imported) {
+        // Присваиваем новый ID, чтобы не перезаписать существующий
+        imported.setId(UUID.randomUUID().toString());
+        imported.setActive(false);
+        workspaces.put(imported.getId(), imported);
+        saveToFile();
+        log.info("Imported workspace: {} ({})", imported.getName(), imported.getId());
+        return imported;
     }
 
     public Optional<Workspace> removeSymbolMinDensity(String workspaceId, String symbol) {

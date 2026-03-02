@@ -35,6 +35,11 @@ public class Workspace {
     private Set<String> blacklistedSymbols = new HashSet<>();
 
     /**
+     * Favorited symbols — shown first in densities view.
+     */
+    private Set<String> favoritedSymbols = new HashSet<>();
+
+    /**
      * User comments per symbol.
      */
     private Map<String, String> symbolComments = new HashMap<>();
@@ -44,12 +49,19 @@ public class Workspace {
      */
     private DensitySortType sortType = DensitySortType.SIZE_USD_DESC;
 
+    /**
+     * How long (in minutes) a density is marked as NEW after first seen.
+     * Frontend-only hint, not used by backend filtering.
+     */
+    private int newBadgeDurationMinutes = 5;
+
     public static Workspace createDefault() {
         Workspace ws = new Workspace();
         ws.setId(UUID.randomUUID().toString());
         ws.setName("Default");
         ws.setActive(true);
         ws.setSortType(DensitySortType.SIZE_USD_DESC);
+        ws.setNewBadgeDurationMinutes(5);
         return ws;
     }
 }
