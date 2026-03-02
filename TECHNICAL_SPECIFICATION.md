@@ -96,10 +96,30 @@ Exchange WS Connectors (Binance, Bybit, OKX, Bitget, MEXC, Hyperliquid)
 #### 3.1.1 Подключение к биржам
 - WebSocket соединения для real-time данных
 - Автоматический реконнект при обрыве (exponential backoff, max 10 попыток)
-- Ping/pong heartbeat каждые 30 сек
-- Stale data detection: если нет данных 90 сек — force reconnect
+- Ping/pong: OkHttp автоматически отвечает на WebSocket ping frames (RFC 6455). Application-level ping отправляется только для бирж, которым он нужен (Bybit, OKX и др.). Binance — без application ping.
+- Stale data detection: если нет данных **5 минут** — force reconnect
+- **24-часовой превентивный reconnect:** Binance обрывает WS-соединения через 24 часа. Система закрывает соединение через 23ч 55мин и переподключается с полной re-инициализацией снапшотов.
 - Подписка на все доступные торговые пары
-- Virtual threads (Java 21) для WebSocket обработки
+- Virtual threads (Java 21) для WebSocket обработки и snapshot fetching
+
+#### 3.1.1.1 Publish Throttle (оптимизация CPU)
+
+Для бирж с высокочастотными diff-based обновлениями (Binance: 100мс Spot, 500мс Futures) прямая публикация `OrderBookUpdateEvent` на каждый delta создаёт чрезмерную нагрузку (~5000 событий/сек при 500+ символах).
+
+**Решение:** Throttle публикации — **1 раз в 2 секунды на символ:**
+- Delta всегда применяется к `LocalOrderBook` (стакан актуален)
+- Но `publishOrderBook()` → `OrderBookUpdateEvent` → `AnomalyDetector` + `DensityTracker` вызывается не чаще 1 раз в 2 сек на символ
+- Первая публикация после snapshot — без throttle
+- Это снижает нагрузку на Spring Events, AnomalyDetector и DensityTracker на порядок
+
+#### 3.1.1.2 Gap Recovery — Refetch Queue
+
+При обнаружении разрыва в последовательности обновлений (gap) символ ставится в очередь для последовательного refetch вместо параллельного запуска virtual threads:
+- `BlockingQueue<String> refetchQueue` — очередь символов для re-инициализации
+- Фоновый `refetchWorker` thread — извлекает из очереди и последовательно запрашивает snapshots
+- Пауза между запросами = `SNAPSHOT_FETCH_DELAY_MS` (2 сек для Spot, 1 сек для Futures)
+- Защита от дублей: если символ уже в состоянии `initializing` — пропускается
+- WS-события для символов в процессе refetch **буферизируются** и применяются после получения snapshot
 
 #### 3.1.2 Фильтрация данных
 - Анализируются только уровни в пределах **10% от текущей цены**
@@ -451,26 +471,101 @@ ws://localhost:8080/ws/densities?workspaceId=<uuid>
 - **Protobuf:** Google Protobuf 3.25.3 (MEXC)
 - **Env:** springboot4-dotenv
 
-### 6.2 Frontend (Фаза 2, планируется)
-- **Фреймворк:** React 18+
+### 6.2 Frontend (базовый каркас создан, не тестировался с бэкендом)
+- **Фреймворк:** React 19
 - **Язык:** TypeScript
-- **WebSocket:** native WebSocket API
-- **UI библиотека:** TBD
+- **Сборщик:** Vite 7 (dev-сервер на порту 3000, proxy → 8080)
+- **Стили:** Tailwind CSS v4 (утилитарные стили, тёмная тема)
+- **State management:** Zustand
+- **WebSocket:** native WebSocket API (wsClient singleton с авторекконектом)
+- **Компоненты:** DensityGrid, SymbolCard, DensityRow, SettingsModal, BlacklistPanel и др.
 
 ---
 
 ## 7. API бирж
 
 ### 7.1 Binance
+
+#### 7.1.1 Подключение и лимиты
 - **Spot WebSocket:** `wss://stream.binance.com:9443/stream` (combined stream)
 - **Futures WebSocket:** `wss://fstream.binance.com/stream` (combined stream)
-- **Orderbook:** diff-based incremental depth
-  - Spot: `<symbol>@depth@100ms`, Futures: `<symbol>@depth@500ms`
-  - Требует REST snapshot: Spot `/api/v3/depth?limit=5000`, Futures `/fapi/v1/depth?limit=1000`
-  - Event buffering до snapshot, gap detection по `U` (Spot) / `pu` (Futures)
-  - Используется `LocalOrderBook` для управления состоянием
-- **Trade stream:** Spot: `<symbol>@trade`, Futures: `<symbol>@aggTrade`
-- **Лимит:** 1024 стрима на соединение (512 символов × 2 стрима)
+- **Лимит стримов:** 1024 стрима на соединение → max 512 символов (depth + trade на каждый)
+- **Ping/pong:** Binance шлёт WebSocket ping frames (Spot: каждые 20 сек, Futures: каждые 3 мин). OkHttp отвечает автоматически. Application-level ping НЕ используется.
+- **24-часовой лимит:** Binance принудительно закрывает WS-соединение через 24 часа. Система делает превентивный reconnect через 23ч 55мин.
+- **REST rate limits:** Spot — 6000 weight/мин на IP. Futures — 2400 weight/мин на IP.
+
+#### 7.1.2 Diff-based Depth Streams
+- Spot: `<symbol>@depth@100ms` — обновления каждые 100мс
+- Futures: `<symbol>@depth@500ms` — обновления каждые 500мс
+- Каждое событие содержит только изменённые уровни (delta), не полный стакан
+- `LocalOrderBook` поддерживает полное состояние стакана in-memory
+
+#### 7.1.3 REST Snapshot для инициализации
+- **Spot:** `GET /api/v3/depth?symbol=X&limit=5000` (weight 250, max глубина Binance)
+- **Futures:** `GET /fapi/v1/depth?symbol=X&limit=1000` (weight 20, 1000 уровней)
+- Snapshot содержит `lastUpdateId` для синхронизации с WS-потоком
+
+#### 7.1.4 Алгоритм инициализации (Spot)
+```
+1. subscribeAll():
+   a. Получить список USDT-пар через REST /api/v3/exchangeInfo
+   b. Ограничить до 512 символов
+   c. Подключиться к WS, подписаться батчами по 20 (пауза 500мс)
+   d. Запустить fetchSnapshotsForAll() в virtual thread
+   e. Запустить refetchWorker для обработки gap-очереди
+
+2. fetchSnapshotsForAll(symbols):
+   Для каждого символа последовательно:
+   a. fetchAndApplySnapshot(symbol)
+   b. Thread.sleep(2000) — rate limiting (weight 250 × 30 req/min = 7500, лимит 6000 → безопасный запас)
+   c. Логирование прогресса каждые 50 символов
+
+3. fetchAndApplySnapshot(symbol):
+   a. Поставить symbol в initializing set
+   b. Создать event buffer для буферизации WS-событий
+   c. GET /api/v3/depth?symbol=X&limit=5000
+   d. Получить lastUpdateId из snapshot
+   e. applySnapshot() в LocalOrderBook
+   f. Обработать буферизованные events:
+      - Пропустить events с u <= lastUpdateId
+      - Первый оставшийся event: U <= lastUpdateId+1 И u >= lastUpdateId+1
+        (event должен "перекрывать" lastUpdateId — по документации Binance)
+      - Если нет такого event → GAP → book.reset() → добавить в refetchQueue
+      - Применить оставшиеся events через applyDelta()
+   g. publishOrderBook()
+   h. Убрать symbol из initializing
+
+4. handleDepthUpdate(data, symbol) — на каждый WS depth event:
+   a. Если initializing → buffer event и return
+   b. Если book не инициализирован → buffer и return
+   c. Gap check: U > book.lastUpdateId + 1
+      → reset book, начать буферизацию, добавить в refetchQueue
+   d. Skip если u <= book.lastUpdateId (уже применено)
+   e. applyDelta() в LocalOrderBook
+   f. Throttle: publishOrderBook только если прошло >= 2 сек с последней публикации
+```
+
+#### 7.1.5 Алгоритм инициализации (Futures)
+Аналогичен Spot, но с отличиями:
+- **Глубина snapshot:** 1000 уровней (weight 20)
+- **Частота запросов:** 1 req/сек (1000 weight/мин при 2400 лимите)
+- **Depth stream:** `@depth@500ms` вместо `@depth@100ms`
+- **Gap detection по pu-chain:** Futures события содержат поле `pu` (previous update id). При обработке проверяется: `event.pu == book.lastUpdateId`. Если нет — gap.
+- **Буфер после snapshot:** Первый валидный event должен иметь `U <= lastUpdateId AND u >= lastUpdateId`, затем каждый последующий event проверяется по pu-chain.
+- **Trade stream:** `@aggTrade` (агрегированные сделки) вместо `@trade`
+
+#### 7.1.6 Reconnect и re-инициализация
+При reconnect (обрыв, 24h лимит, stale data):
+1. Все `LocalOrderBook` сбрасываются (reset)
+2. Все символы помечаются как `initializing`
+3. Заново подписка на стримы (resubscribeAll в AbstractWebSocketConnector)
+4. Запускается `fetchSnapshotsForAll()` для полной re-инициализации
+5. WS-события буферизируются до получения нового snapshot
+
+#### 7.1.7 Trade Stream
+- Spot: `<symbol>@trade` — каждая сделка отдельно
+- Futures: `<symbol>@aggTrade` — агрегированные сделки
+- Используется для: обновления lastPrice и VolumeTracker (15-мин скользящее окно)
 
 ### 7.2 Bybit
 - **Spot WebSocket:** `wss://stream.bybit.com/v5/public/spot`
@@ -640,9 +735,15 @@ cryptoview:
 | `WS_BROADCAST_INTERVAL` | 500мс | DensityWebSocketHandler | Интервал broadcast |
 | `Z_SCORE_THRESHOLD` | 3.0 | AnomalyDetector | Порог статистической аномалии |
 | `IQR_MULTIPLIER` | 3.0 | AnomalyDetector | Множитель IQR |
-| `STALE_DATA_THRESHOLD_MS` | 90,000 | AbstractWebSocketConnector | Force reconnect при молчании |
+| `STALE_DATA_THRESHOLD_MS` | 300,000 (5 мин) | AbstractWebSocketConnector | Force reconnect при молчании |
+| `MAX_CONNECTION_LIFETIME_MS` | 23ч 55мин | AbstractWebSocketConnector | Превентивный reconnect до 24h Binance лимита |
 | `MAX_RECONNECT_ATTEMPTS` | 10 | AbstractWebSocketConnector | Макс. попыток реконнекта |
 | `PING_INTERVAL_SEC` | 30 | AbstractWebSocketConnector | Heartbeat интервал |
+| `PUBLISH_THROTTLE_MS` | 2,000 | BinanceSpot/FuturesConnector | Max частота публикации orderbook на символ |
+| `SNAPSHOT_LIMIT` (Spot) | 5,000 | BinanceSpotConnector | Глубина REST snapshot (max Binance, weight 250) |
+| `SNAPSHOT_LIMIT` (Futures) | 1,000 | BinanceFuturesConnector | Глубина REST snapshot (weight 20) |
+| `SNAPSHOT_FETCH_DELAY_MS` (Spot) | 2,000 | BinanceSpotConnector | Пауза между snapshot запросами |
+| `SNAPSHOT_FETCH_DELAY_MS` (Futures) | 1,000 | BinanceFuturesConnector | Пауза между snapshot запросами |
 
 ---
 
@@ -686,12 +787,29 @@ cryptoview:
 - WebSocket `/ws/densities` (500мс broadcast)
 - CORS для React (localhost:3000)
 
-### Фаза 2: Frontend (планируется)
-- React приложение
-- Дашборд с плотностями в реальном времени
-- Управление workspaces
-- Blacklist, комментарии, пороги через UI
-- WebSocket подключение к `/ws/densities`
+### Фаза 1.7: Diff-based depth ✅
+- LocalOrderBook (thread-safe, snapshot + delta)
+- Все коннекторы переведены на incremental depth
+- Binance, Bybit, OKX, Bitget — полная/расширенная глубина
+
+### Фаза 1.8: Исправление и оптимизация коннекторов (в процессе)
+- ✅ **Binance Spot:** правильный gap detection по документации (U/u), snapshot depth 5000, refetchQueue, publish throttle 2 сек, 24h reconnect
+- ✅ **Binance Futures:** правильный gap detection по pu-chain, refetchQueue, publish throttle 2 сек, 24h reconnect
+- ✅ **AbstractWebSocketConnector:** 24h reconnect timer (23ч 55мин), stale threshold 5 мин, onResubscribed() hook
+- [ ] Bybit Spot/Futures — ревизия
+- [ ] OKX Spot/Futures — ревизия
+- [ ] Bitget Spot/Futures — ревизия
+- [ ] MEXC Spot — ревизия
+- [ ] Hyperliquid — ревизия
+
+### Фаза 2: Frontend (базовый каркас создан)
+- ✅ React 19 + TypeScript + Vite 7 + Tailwind CSS v4 + Zustand
+- ✅ Компоненты: DensityGrid, SymbolCard, DensityRow, SettingsModal, BlacklistPanel
+- ✅ API клиент, WebSocket клиент с авторекконектом
+- ✅ `npm run build` компилируется без ошибок
+- [ ] **Первый запуск и отладка с бэкендом**
+- [ ] Иконки бирж, анимации, полировка UI
+- [ ] Управление несколькими workspaces из UI
 
 ---
 

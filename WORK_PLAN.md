@@ -139,10 +139,13 @@
 - [x] Метод getSnapshot(quantityMultiplier) для futures ctVal конвертации
 
 ### Этап 20: Binance Spot/Futures — diff-based depth ✅
-- [x] Spot: `@depth@100ms` + REST snapshot `/api/v3/depth?limit=5000`
-- [x] Futures: `@depth@500ms` + REST snapshot `/fapi/v1/depth?limit=1000`
-- [x] Event buffering до snapshot, gap detection по U/pu
+- [x] Spot: `@depth@100ms` + REST snapshot `/api/v3/depth?limit=5000` (weight 250, max глубина)
+- [x] Futures: `@depth@500ms` + REST snapshot `/fapi/v1/depth?limit=1000` (weight 20)
+- [x] Event buffering до snapshot, gap detection по U/u (Spot) и pu-chain (Futures)
 - [x] Virtual threads для snapshot fetching, rate limiting
+- [x] **Исправлено:** правильный gap detection по документации Binance
+- [x] **Исправлено:** refetchQueue вместо параллельных virtual threads (fix каскадного gap storm)
+- [x] **Добавлено:** publish throttle 2 сек на символ (снижение нагрузки на Spring Events)
 
 ### Этап 21: Bybit Spot/Futures — orderbook.200 ✅
 - [x] `orderbook.200` канал (200 уровней, snapshot + delta)
@@ -163,25 +166,98 @@
 
 ---
 
-## Фаза 2: Frontend (планируется)
+## Фаза 1.8: Исправление и оптимизация коннекторов
 
-### Этап 1: Инициализация
-- [ ] Create React App / Vite
-- [ ] TypeScript конфигурация
-- [ ] UI библиотека
+### Этап 25: AbstractWebSocketConnector — улучшения ✅
+- [x] 24-часовой превентивный reconnect (23ч 55мин) — Binance обрывает WS через 24ч
+- [x] Stale data threshold увеличен с 90 сек до 5 мин (OkHttp ping/pong работает автоматически)
+- [x] Добавлен хук `onResubscribed()` для полной re-инициализации снапшотов после reconnect
+- [x] Сброс `debugMessageCount` при reconnect для логирования первых сообщений нового соединения
+- [x] `connectionStartTime` — трекинг времени жизни соединения
 
-### Этап 2: Компоненты
-- [ ] Layout с боковой панелью
-- [ ] Таблица плотностей (real-time, сортировка, durationSeconds)
-- [ ] Управление workspaces (создание, переключение, настройки)
-- [ ] Blacklist, комментарии, пороги через UI
+### Этап 26: BinanceSpotConnector — полная переработка ✅
+- [x] Правильный gap detection по документации Binance: `U <= lastUpdateId+1 AND u >= lastUpdateId+1`
+- [x] Snapshot depth увеличен до 5000 (max Binance, weight 250) — полнота стакана в пределах 10%
+- [x] `BlockingQueue<String> refetchQueue` + `refetchWorker` — последовательный refetch при gap (вместо параллельных virtual threads)
+- [x] Publish throttle: `OrderBookUpdateEvent` публикуется max 1 раз в 2 сек на символ (delta всегда применяется)
+- [x] `Set<String> initializing` — защита от параллельных refetch одного символа
+- [x] `Map<String, AtomicInteger> gapCounts` — счётчик gap-ов для логирования
+- [x] Application-level ping отключён (OkHttp отвечает на Binance ping frames автоматически)
+- [x] `onResubscribed()` — полный reset + refetch всех книг при reconnect
+- [x] Улучшенный `getStatusSummary()`: books, gaps, refetchQ
 
-### Этап 3: Интеграция
-- [ ] WebSocket подключение к /ws/densities
-- [ ] REST API для CRUD workspaces/settings
-- [ ] Смена workspace на лету
+### Этап 27: BinanceFuturesConnector — полная переработка ✅
+- [x] Gap detection по `pu`-chain: `event.pu == book.lastUpdateId`
+- [x] Буфер после snapshot: первый event `U <= lastUpdateId AND u >= lastUpdateId`, затем pu-chain валидация
+- [x] `refetchQueue` + `refetchWorker` — аналогично Spot
+- [x] Publish throttle 2 сек на символ
+- [x] Application-level ping отключён
+- [x] Snapshot depth 1000 (weight 20), fetch delay 1 сек
+- [x] `onResubscribed()` — полный reset + refetch
 
-### Этап 4: Дополнительно
+### Этап 28: Bybit Spot/Futures — ревизия
+- [ ] Проверить gap detection и recovery
+- [ ] Проверить publish throttle (если нужен)
+- [ ] Проверить reconnect и re-инициализацию
+
+### Этап 29: OKX Spot/Futures — ревизия
+- [ ] Проверить seqId/prevSeqId gap detection
+- [ ] Проверить ctVal multiplier для Futures
+- [ ] Проверить reconnect и re-инициализацию
+
+### Этап 30: Bitget Spot/Futures — ревизия
+- [ ] Проверить seq/pseq gap detection
+- [ ] Проверить REST snapshot fallback
+- [ ] Проверить reconnect и re-инициализацию
+
+### Этап 31: MEXC Spot — ревизия
+- [ ] Проверить protobuf parsing
+- [ ] Проверить connection pool
+
+### Этап 32: Hyperliquid — ревизия
+- [ ] Проверить l2Book обработку
+- [ ] Проверить USDC пары
+
+### Этап 33: Документация ✅
+- [x] Обновление CLAUDE.md (алгоритмы Binance, история багов)
+- [x] Обновление TECHNICAL_SPECIFICATION.md (подключение, Binance алгоритмы, константы, фазы)
+- [x] Обновление WORK_PLAN.md (фаза 1.8, статус этапов)
+
+---
+
+## Фаза 2: Frontend
+
+### Этап 1: Инициализация ✅
+- [x] Vite 7 + React 19 + TypeScript
+- [x] Tailwind CSS v4 (тёмная тема)
+- [x] Zustand (state management)
+- [x] Vite proxy: `/api` и `/ws` → `localhost:8080`
+
+### Этап 2: Компоненты ✅ (каркас, не тестировался с бэкендом)
+- [x] Header (WS-индикатор, workspace name, кнопки)
+- [x] DensityGrid (responsive сетка карточек)
+- [x] SymbolCard (карточка монеты: звёздочка, ЧС, настройки)
+- [x] DensityRow (строка плотности: биржа, объём, цена, расстояние, NEW)
+- [x] SettingsModal (настройки workspace: биржи, сортировка, мин. размер)
+- [x] BlacklistPanel (управление ЧС)
+- [x] SymbolSettingsPopup (настройки конкретной монеты)
+
+### Этап 3: Интеграция ✅ (код написан, не тестировался)
+- [x] WebSocket клиент с авторекконектом (wsClient singleton)
+- [x] REST API клиент (httpClient: workspaceApi, symbolApi, densityApi, statusApi)
+- [x] Zustand stores: workspaceStore, densityStore, uiStore
+- [x] `npm run build` компилируется без ошибок
+
+### Этап 4: Отладка с бэкендом
+- [ ] **Первый запуск и тестирование с работающим бэкендом**
+- [ ] Маппинг enabledMarkets (фронт: объекты → бэкенд: строки)
+- [ ] WebSocket proxy через Vite
+- [ ] Обработка 204 No Content ответов
+- [ ] Иконки бирж (SVG)
+- [ ] Анимации, полировка UI
+
+### Этап 5: Дополнительно
+- [ ] Управление несколькими workspaces из UI
 - [ ] Тестирование (integration, e2e)
 - [ ] Деплой
 
@@ -215,6 +291,15 @@
 | 22. OKX books (400) | Средняя | ✅ |
 | 23. Bitget books (full) | Средняя | ✅ |
 | 24. Документация | Низкая | ✅ |
+| 25. AbstractWSConnector улучшения | Средняя | ✅ |
+| 26. BinanceSpot переработка | Высокая | ✅ |
+| 27. BinanceFutures переработка | Высокая | ✅ |
+| 28. Bybit ревизия | Средняя | ⬜ |
+| 29. OKX ревизия | Средняя | ⬜ |
+| 30. Bitget ревизия | Средняя | ⬜ |
+| 31. MEXC ревизия | Низкая | ⬜ |
+| 32. Hyperliquid ревизия | Низкая | ⬜ |
+| 33. Документация | Низкая | ✅ |
 
 ---
 
@@ -267,10 +352,18 @@
         │                          │
         ├──────────────────────────┘
         ▼
-[22. OKX books (400)] ✅
-        │
-        ▼
-[23. Bitget books (full)] ✅
+[22. OKX books (400)] ✅ ──── [23. Bitget books (full)] ✅
+                                        │
+                                        ▼
+                             [25. AbstractWSConnector] ✅
+                                        │
+                              ┌─────────┴─────────┐
+                              ▼                    ▼
+                    [26. BinanceSpot] ✅  [27. BinanceFutures] ✅
+                              │                    │
+                              └─────────┬──────────┘
+                                        ▼
+                    [28-32. Ревизия остальных бирж] ⬜
 ```
 
 ---

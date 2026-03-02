@@ -16,11 +16,13 @@ import org.springframework.stereotype.Component;
 
 import java.io.IOException;
 import java.math.BigDecimal;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.Set;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.stream.Collectors;
 
 @Slf4j
@@ -30,11 +32,19 @@ public class BinanceFuturesConnector extends AbstractWebSocketConnector {
     private static final String WS_URL = "wss://fstream.binance.com/stream";
     private static final String REST_URL = "https://fapi.binance.com/fapi/v1/exchangeInfo";
     private static final String DEPTH_SNAPSHOT_URL = "https://fapi.binance.com/fapi/v1/depth";
-    private static final int SNAPSHOT_LIMIT = 1000;
+    private static final int SNAPSHOT_LIMIT = 1000; // weight 20 for futures
+    private static final long SNAPSHOT_FETCH_DELAY_MS = 1000; // 60 req/min at weight 20, IP limit 2400/min
+    private static final long PUBLISH_THROTTLE_MS = 2000; // publish orderbook max once per 2 sec per symbol
+    private static final int MAX_SYMBOLS = 512; // 1024 streams / 2 streams per symbol
 
     private final Map<String, LocalOrderBook> localBooks = new ConcurrentHashMap<>();
     private final Map<String, CopyOnWriteArrayList<JsonNode>> eventBuffers = new ConcurrentHashMap<>();
-    private final Map<String, Boolean> initializing = new ConcurrentHashMap<>();
+    private final Set<String> initializing = ConcurrentHashMap.newKeySet();
+    private final Map<String, Instant> lastPublishTime = new ConcurrentHashMap<>();
+    private final BlockingQueue<String> refetchQueue = new LinkedBlockingQueue<>();
+    private final Map<String, AtomicInteger> gapCounts = new ConcurrentHashMap<>();
+
+    private volatile Thread refetchWorkerThread;
 
     public BinanceFuturesConnector(OkHttpClient httpClient,
                                     ObjectMapper objectMapper,
@@ -60,55 +70,114 @@ public class BinanceFuturesConnector extends AbstractWebSocketConnector {
 
     @Override
     protected void onConnected() {
-        log.info("[BINANCE:FUTURES] Connected, ready to subscribe");
+        log.info("[BINANCE:FUTURES] WebSocket connected, ready to subscribe");
     }
 
     @Override
     public void subscribeAll() {
         List<String> symbols = fetchAllSymbols();
-        if (!symbols.isEmpty()) {
-            int maxSymbols = 512;
-            if (symbols.size() > maxSymbols) {
-                log.warn("[BINANCE:FUTURES] Limiting from {} to {} symbols (1024 stream limit)",
-                        symbols.size(), maxSymbols);
-                symbols = symbols.subList(0, maxSymbols);
+        if (symbols.isEmpty()) {
+            log.error("[BINANCE:FUTURES] No symbols found, aborting");
+            return;
+        }
+
+        if (symbols.size() > MAX_SYMBOLS) {
+            log.warn("[BINANCE:FUTURES] Limiting from {} to {} symbols (1024 stream limit)", symbols.size(), MAX_SYMBOLS);
+            symbols = symbols.subList(0, MAX_SYMBOLS);
+        }
+
+        if (!connectAndWait(5000)) {
+            log.error("[BINANCE:FUTURES] Failed to connect WebSocket, aborting subscribe");
+            return;
+        }
+
+        int batchSize = 20;
+        for (int i = 0; i < symbols.size(); i += batchSize) {
+            int end = Math.min(i + batchSize, symbols.size());
+            List<String> batch = symbols.subList(i, end);
+            subscribe(batch);
+            try {
+                Thread.sleep(500);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
             }
+        }
+        log.info("[BINANCE:FUTURES] Subscribed to {} symbols ({} streams)", symbols.size(), symbols.size() * 2);
 
-            if (!connectAndWait(5000)) {
-                log.error("[BINANCE:FUTURES] Failed to connect WebSocket, aborting subscribe");
-                return;
+List<String> symbolsCopy = List.copyOf(subscribedSymbols);
+        Thread.startVirtualThread(() -> fetchSnapshotsForAll(symbolsCopy));
+
+        startRefetchWorker();
+    }
+
+    @Override
+    protected void onResubscribed() {
+        log.info("[BINANCE:FUTURES] Reconnected, resetting all local books and refetching snapshots");
+        for (String symbol : subscribedSymbols) {
+            LocalOrderBook book = localBooks.get(symbol);
+            if (book != null) {
+                book.reset();
             }
+            initializing.add(symbol);
+            eventBuffers.put(symbol, new CopyOnWriteArrayList<>());
+        }
+        List<String> symbolsCopy = List.copyOf(subscribedSymbols);
+        Thread.startVirtualThread(() -> fetchSnapshotsForAll(symbolsCopy));
+    }
 
-            int batchSize = 20;
-            for (int i = 0; i < symbols.size(); i += batchSize) {
-                int end = Math.min(i + batchSize, symbols.size());
-                List<String> batch = symbols.subList(i, end);
-                subscribe(batch);
-
+    private void startRefetchWorker() {
+        if (refetchWorkerThread != null && refetchWorkerThread.isAlive()) {
+            return;
+        }
+        refetchWorkerThread = Thread.startVirtualThread(() -> {
+            log.info("[BINANCE:FUTURES] Refetch worker started");
+            while (!Thread.currentThread().isInterrupted()) {
                 try {
-                    Thread.sleep(500);
+                    String symbol = refetchQueue.poll(5, TimeUnit.SECONDS);
+                    if (symbol != null) {
+                        if (!initializing.contains(symbol)) {
+                            initializing.add(symbol);
+                            eventBuffers.put(symbol, new CopyOnWriteArrayList<>());
+                        }
+                        fetchAndApplySnapshot(symbol);
+                        Thread.sleep(SNAPSHOT_FETCH_DELAY_MS);
+                    }
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
                     break;
+                } catch (Exception e) {
+                    log.error("[BINANCE:FUTURES] Refetch worker error", e);
                 }
             }
-            log.info("[BINANCE:FUTURES] Subscribed to {} symbols", symbols.size());
-
-            Thread.startVirtualThread(() -> fetchSnapshotsForAll(List.copyOf(subscribedSymbols)));
-        }
+            log.info("[BINANCE:FUTURES] Refetch worker stopped");
+        });
     }
 
+    // ======================== Snapshot Initialization ========================
+
     private void fetchSnapshotsForAll(List<String> symbols) {
-        log.info("[BINANCE:FUTURES] Fetching depth snapshots for {} symbols...", symbols.size());
+        log.info("[BINANCE:FUTURES] Starting snapshot fetch for {} symbols (limit={}, delay={}ms)...",
+                symbols.size(), SNAPSHOT_LIMIT, SNAPSHOT_FETCH_DELAY_MS);
         int count = 0;
         int failed = 0;
+        long startTime = System.currentTimeMillis();
+
         for (String symbol : symbols) {
+            if (!connected.get()) {
+                log.warn("[BINANCE:FUTURES] Connection lost during snapshot fetch, stopping at {}/{}", count, symbols.size());
+                break;
+            }
             try {
                 fetchAndApplySnapshot(symbol);
                 count++;
-                // limit=1000 costs 20 weight, IP limit 2400/min → up to 120 req/min.
-                // 1 request per second — safe margin.
-                Thread.sleep(1000);
+                if (count % 50 == 0) {
+                    long elapsed = (System.currentTimeMillis() - startTime) / 1000;
+                    int initialized = countInitializedBooks();
+                    log.info("[BINANCE:FUTURES] Snapshot progress: {}/{} fetched, {} failed, {} initialized, {}s elapsed",
+                            count, symbols.size(), failed, initialized, elapsed);
+                }
+                Thread.sleep(SNAPSHOT_FETCH_DELAY_MS);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 break;
@@ -117,61 +186,91 @@ public class BinanceFuturesConnector extends AbstractWebSocketConnector {
                 log.warn("[BINANCE:FUTURES] Failed to fetch snapshot for {}: {}", symbol, e.getMessage());
             }
         }
-        log.info("[BINANCE:FUTURES] Snapshots done: {}/{} fetched, {} failed", count, symbols.size(), failed);
+
+        long elapsed = (System.currentTimeMillis() - startTime) / 1000;
+        log.info("[BINANCE:FUTURES] Snapshot fetch complete: {}/{} ok, {} failed, {}s total, {} books initialized",
+                count, symbols.size(), failed, elapsed, countInitializedBooks());
     }
 
     private void fetchAndApplySnapshot(String symbol) {
-        initializing.put(symbol, true);
+        initializing.add(symbol);
         eventBuffers.putIfAbsent(symbol, new CopyOnWriteArrayList<>());
 
         String url = DEPTH_SNAPSHOT_URL + "?symbol=" + symbol + "&limit=" + SNAPSHOT_LIMIT;
         Request request = new Request.Builder().url(url).build();
 
         try (Response response = executeWithRetry(request, 3, 5000)) {
-            if (response.body() != null) {
-                JsonNode root = objectMapper.readTree(response.body().string());
-                long lastUpdateId = root.get("lastUpdateId").asLong();
-                List<List<String>> bids = parseLevelsRaw(root.get("bids"));
-                List<List<String>> asks = parseLevelsRaw(root.get("asks"));
-
-                LocalOrderBook book = localBooks.computeIfAbsent(symbol, LocalOrderBook::new);
-                book.applySnapshot(bids, asks, lastUpdateId);
-
-                // Apply buffered events (Futures algorithm)
-                CopyOnWriteArrayList<JsonNode> buffer = eventBuffers.remove(symbol);
-                if (buffer != null) {
-                    boolean foundFirst = false;
-                    for (JsonNode event : buffer) {
-                        long u = event.get("u").asLong();
-                        long U = event.get("U").asLong();
-
-                        // Drop events where u < lastUpdateId
-                        if (u < lastUpdateId) continue;
-
-                        // First event: U <= lastUpdateId AND u >= lastUpdateId
-                        if (!foundFirst) {
-                            if (U <= lastUpdateId && u >= lastUpdateId) {
-                                foundFirst = true;
-                            } else {
-                                continue;
-                            }
-                        }
-
-                        applyDiffEvent(book, event);
-                    }
-                }
-
-                publishOrderBook(symbol, book);
+            if (response.body() == null) {
+                log.warn("[BINANCE:FUTURES] Empty response body for snapshot {}", symbol);
                 initializing.remove(symbol);
-
-                log.debug("[BINANCE:FUTURES] Initialized {} with {} bids + {} asks",
-                        symbol, book.getBidCount(), book.getAskCount());
+                return;
             }
+
+            JsonNode root = objectMapper.readTree(response.body().string());
+            long lastUpdateId = root.get("lastUpdateId").asLong();
+            List<List<String>> bids = parseLevelsRaw(root.get("bids"));
+            List<List<String>> asks = parseLevelsRaw(root.get("asks"));
+
+            LocalOrderBook book = localBooks.computeIfAbsent(symbol, LocalOrderBook::new);
+            book.applySnapshot(bids, asks, lastUpdateId);
+
+            // Apply buffered events (Futures algorithm):
+            // 1. Drop events where u < lastUpdateId
+            // 2. First valid event must have U <= lastUpdateId AND u >= lastUpdateId
+            // 3. After first: validate pu chain (each pu == previous u)
+            CopyOnWriteArrayList<JsonNode> buffer = eventBuffers.remove(symbol);
+            if (buffer != null && !buffer.isEmpty()) {
+                boolean foundFirst = false;
+                long prevU = lastUpdateId;
+
+                for (JsonNode event : buffer) {
+                    long u = event.get("u").asLong();
+                    long U = event.get("U").asLong();
+                    long pu = event.has("pu") ? event.get("pu").asLong() : -1;
+
+                    // Drop events before snapshot
+                    if (u < lastUpdateId) continue;
+
+                    if (!foundFirst) {
+                        // First event: U <= lastUpdateId AND u >= lastUpdateId
+                        if (U <= lastUpdateId && u >= lastUpdateId) {
+                            foundFirst = true;
+                            prevU = u;
+                            applyDiffEvent(book, event);
+                            continue;
+                        } else {
+                            // Skip events that don't bridge the snapshot
+                            continue;
+                        }
+                    }
+
+                    // Subsequent events: validate pu chain
+                    if (pu != -1 && pu != prevU) {
+                        log.warn("[BINANCE:FUTURES] Gap in buffered events for {} (pu={}, expectedPu={}), re-queuing",
+                                symbol, pu, prevU);
+                        book.reset();
+                        initializing.remove(symbol);
+                        refetchQueue.offer(symbol);
+                        return;
+                    }
+
+                    applyDiffEvent(book, event);
+                    prevU = u;
+                }
+            }
+
+            publishOrderBook(symbol, book);
+            initializing.remove(symbol);
+
+            log.debug("[BINANCE:FUTURES] Initialized {} ({} bids + {} asks, lastUpdateId={})",
+                    symbol, book.getBidCount(), book.getAskCount(), lastUpdateId);
         } catch (IOException e) {
-            log.error("[BINANCE:FUTURES] Failed to fetch snapshot for {}", symbol, e);
+            log.error("[BINANCE:FUTURES] Snapshot fetch failed for {}: {}", symbol, e.getMessage());
             initializing.remove(symbol);
         }
     }
+
+    // ======================== Symbol Discovery ========================
 
     private List<String> fetchAllSymbols() {
         Request request = new Request.Builder().url(REST_URL).build();
@@ -199,11 +298,13 @@ public class BinanceFuturesConnector extends AbstractWebSocketConnector {
                 return usdtSymbols;
             }
         } catch (IOException e) {
-            log.error("[BINANCE:FUTURES] Failed to fetch symbols after retries", e);
+            log.error("[BINANCE:FUTURES] Failed to fetch symbols: {}", e.getMessage());
         }
 
         return List.of();
     }
+
+    // ======================== Subscription ========================
 
     @Override
     public void subscribe(List<String> symbols) {
@@ -222,7 +323,6 @@ public class BinanceFuturesConnector extends AbstractWebSocketConnector {
         webSocket.send(msg);
 
         subscribedSymbols.addAll(symbols);
-        log.debug("[BINANCE:FUTURES] Subscribed to {} symbols ({} streams)", symbols.size(), allStreams.size());
     }
 
     @Override
@@ -241,6 +341,8 @@ public class BinanceFuturesConnector extends AbstractWebSocketConnector {
                 .map(s -> "\"" + s + "\"")
                 .collect(Collectors.joining(",")) + "]";
     }
+
+    // ======================== Message Handling ========================
 
     @Override
     protected void handleMessage(String message) {
@@ -278,7 +380,8 @@ public class BinanceFuturesConnector extends AbstractWebSocketConnector {
     }
 
     private void handleDepthUpdate(JsonNode data, String symbol) {
-        if (initializing.containsKey(symbol)) {
+        // If initializing — buffer the event
+        if (initializing.contains(symbol)) {
             CopyOnWriteArrayList<JsonNode> buffer = eventBuffers.get(symbol);
             if (buffer != null) {
                 buffer.add(data);
@@ -288,41 +391,43 @@ public class BinanceFuturesConnector extends AbstractWebSocketConnector {
 
         LocalOrderBook book = localBooks.get(symbol);
         if (book == null || !book.isInitialized()) {
-            // Not yet initialized — just buffer the event.
-            // fetchSnapshotsForAll() will get to this symbol in due course.
-            eventBuffers.putIfAbsent(symbol, new CopyOnWriteArrayList<>());
-            CopyOnWriteArrayList<JsonNode> buffer = eventBuffers.get(symbol);
-            if (buffer != null) {
-                buffer.add(data);
-            }
+            eventBuffers.computeIfAbsent(symbol, k -> new CopyOnWriteArrayList<>()).add(data);
             return;
         }
 
-        // Futures uses pu (previous update id) for continuity check
-        long pu = data.has("pu") ? data.get("pu").asLong() : -1;
         long u = data.get("u").asLong();
+        // Futures uses pu (previous update id) for continuity chain
+        long pu = data.has("pu") ? data.get("pu").asLong() : -1;
 
+        // Gap detection: pu should equal book's last update id
         if (pu != -1 && pu != book.getLastUpdateId()) {
-            // pu should equal last event's u — gap detected
-            log.warn("[BINANCE:FUTURES] Gap for {} (pu={}, lastUpdateId={}), re-initializing",
-                    symbol, pu, book.getLastUpdateId());
+            int gapCount = gapCounts.computeIfAbsent(symbol, k -> new AtomicInteger(0)).incrementAndGet();
+            log.warn("[BINANCE:FUTURES] Gap #{} for {} (pu={}, lastUpdateId={}), queuing refetch",
+                    gapCount, symbol, pu, book.getLastUpdateId());
             book.reset();
-            // Re-queue for re-fetch with a short delay to avoid burst
-            eventBuffers.putIfAbsent(symbol, new CopyOnWriteArrayList<>());
-            Thread.startVirtualThread(() -> {
-                try { Thread.sleep(1000); } catch (InterruptedException ignored) { Thread.currentThread().interrupt(); }
-                fetchAndApplySnapshot(symbol);
-            });
+            initializing.add(symbol);
+            eventBuffers.put(symbol, new CopyOnWriteArrayList<>());
+            eventBuffers.get(symbol).add(data);
+            refetchQueue.offer(symbol);
             return;
         }
 
+        // Skip already applied events
         if (u <= book.getLastUpdateId()) {
             return;
         }
 
+        // Apply delta — always keep local book up-to-date
         applyDiffEvent(book, data);
         incrementOrderbookUpdates();
-        publishOrderBook(symbol, book);
+
+        // Throttled publish
+        Instant lastPublish = lastPublishTime.get(symbol);
+        Instant now = Instant.now();
+        if (lastPublish == null || java.time.Duration.between(lastPublish, now).toMillis() >= PUBLISH_THROTTLE_MS) {
+            publishOrderBook(symbol, book);
+            lastPublishTime.put(symbol, now);
+        }
     }
 
     private void applyDiffEvent(LocalOrderBook book, JsonNode data) {
@@ -330,12 +435,8 @@ public class BinanceFuturesConnector extends AbstractWebSocketConnector {
         List<List<String>> bids = parseLevelsRaw(data.get("b"));
         List<List<String>> asks = parseLevelsRaw(data.get("a"));
 
-        if (bids.isEmpty()) {
-            bids = parseLevelsRaw(data.get("bids"));
-        }
-        if (asks.isEmpty()) {
-            asks = parseLevelsRaw(data.get("asks"));
-        }
+        if (bids.isEmpty()) bids = parseLevelsRaw(data.get("bids"));
+        if (asks.isEmpty()) asks = parseLevelsRaw(data.get("asks"));
 
         book.applyDelta(bids, asks, u);
     }
@@ -370,19 +471,40 @@ public class BinanceFuturesConnector extends AbstractWebSocketConnector {
         );
     }
 
+    // ======================== Utilities ========================
+
     private List<List<String>> parseLevelsRaw(JsonNode levels) {
         List<List<String>> result = new ArrayList<>();
-        if (levels == null || !levels.isArray()) {
-            return result;
-        }
+        if (levels == null || !levels.isArray()) return result;
         for (JsonNode level : levels) {
             result.add(List.of(level.get(0).asText(), level.get(1).asText()));
         }
         return result;
     }
 
+    private int countInitializedBooks() {
+        return (int) localBooks.values().stream().filter(LocalOrderBook::isInitialized).count();
+    }
+
     @Override
     protected String getPingMessage() {
+        // Binance Futures sends ping frames every 3 min; OkHttp responds automatically.
         return null;
+    }
+
+    @Override
+    public String getStatusSummary() {
+        Instant lastMsg = lastMessageTime.get();
+        String lastMsgStr = lastMsg != null
+                ? java.time.Duration.between(lastMsg, Instant.now()).toSeconds() + "s ago"
+                : "never";
+        int initialized = countInitializedBooks();
+        int pending = initializing.size();
+        int totalGaps = gapCounts.values().stream().mapToInt(AtomicInteger::get).sum();
+        return String.format("msgs=%d, errs=%d, ob=%d, trades=%d, last=%s, syms=%d, books=%d/%d, gaps=%d, refetchQ=%d",
+                messagesReceived.get(), messageErrors.get(),
+                orderbookUpdates.get(), tradeUpdates.get(),
+                lastMsgStr, subscribedSymbols.size(),
+                initialized, localBooks.size(), totalGaps, refetchQueue.size());
     }
 }

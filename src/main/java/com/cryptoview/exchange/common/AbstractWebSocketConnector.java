@@ -39,6 +39,7 @@ public abstract class AbstractWebSocketConnector implements ExchangeConnector {
     protected final AtomicLong orderbookUpdates = new AtomicLong(0);
     protected final AtomicLong tradeUpdates = new AtomicLong(0);
     protected final AtomicReference<Instant> lastMessageTime = new AtomicReference<>();
+    protected final AtomicReference<Instant> connectionStartTime = new AtomicReference<>();
     private final AtomicInteger debugMessageCount = new AtomicInteger(0);
     private static final int DEBUG_MESSAGE_LIMIT = 3;
 
@@ -49,7 +50,8 @@ public abstract class AbstractWebSocketConnector implements ExchangeConnector {
     private static final int MAX_RECONNECT_ATTEMPTS = 10;
     private static final long INITIAL_RECONNECT_DELAY_MS = 1000;
     private static final long MAX_RECONNECT_DELAY_MS = 60000;
-    private static final long STALE_DATA_THRESHOLD_MS = 90_000; // 90 seconds
+    private static final long STALE_DATA_THRESHOLD_MS = 300_000; // 5 minutes (OkHttp handles ping/pong automatically)
+    private static final long MAX_CONNECTION_LIFETIME_MS = 23 * 60 * 60 * 1000L + 55 * 60 * 1000L; // 23h 55min
 
     protected AbstractWebSocketConnector(OkHttpClient httpClient,
                                           ObjectMapper objectMapper,
@@ -105,6 +107,8 @@ public abstract class AbstractWebSocketConnector implements ExchangeConnector {
                 connected.set(true);
                 connecting.set(false);
                 reconnectAttempts.set(0);
+                connectionStartTime.set(Instant.now());
+                debugMessageCount.set(0);
                 onConnected();
                 startPingTask();
             }
@@ -257,6 +261,14 @@ public abstract class AbstractWebSocketConnector implements ExchangeConnector {
             }
         }
         log.info("[{}:{}] Resubscribed to {} symbols", getExchange(), getMarketType(), symbols.size());
+        onResubscribed();
+    }
+
+    /**
+     * Called after resubscription completes. Override to trigger snapshot refetch etc.
+     */
+    protected void onResubscribed() {
+        // Default: no-op. Subclasses can override.
     }
 
     protected int getResubscribeBatchSize() {
@@ -274,16 +286,33 @@ public abstract class AbstractWebSocketConnector implements ExchangeConnector {
         stopPingTask();
         pingTask = scheduler.scheduleAtFixedRate(() -> {
             if (connected.get() && webSocket != null) {
-                // Send ping
+                // Send application-level ping (if connector needs it)
                 String ping = getPingMessage();
                 if (ping != null) {
                     webSocket.send(ping);
                 }
 
-                // Stale data detection: if we have subscriptions but no messages for too long, force reconnect
+                Instant now = Instant.now();
+
+                // 24h connection lifetime check — reconnect before Binance kills it
+                Instant connStart = connectionStartTime.get();
+                if (connStart != null) {
+                    long connAgeMs = java.time.Duration.between(connStart, now).toMillis();
+                    if (connAgeMs > MAX_CONNECTION_LIFETIME_MS) {
+                        log.info("[{}:{}] Connection approaching 24h limit (age={}h {}m), initiating graceful reconnect",
+                                getExchange(), getMarketType(),
+                                connAgeMs / 3600000, (connAgeMs % 3600000) / 60000);
+                        if (webSocket != null) {
+                            webSocket.close(1000, "24h lifetime reconnect");
+                        }
+                        return;
+                    }
+                }
+
+                // Stale data detection
                 Instant lastMsg = lastMessageTime.get();
                 if (lastMsg != null && !subscribedSymbols.isEmpty()) {
-                    long silenceMs = java.time.Duration.between(lastMsg, Instant.now()).toMillis();
+                    long silenceMs = java.time.Duration.between(lastMsg, now).toMillis();
                     if (silenceMs > STALE_DATA_THRESHOLD_MS) {
                         log.warn("[{}:{}] Stale connection detected (no data for {}s), forcing reconnect",
                                 getExchange(), getMarketType(), silenceMs / 1000);
