@@ -67,7 +67,7 @@ public class BybitSpotConnector extends AbstractWebSocketConnector {
                 return;
             }
 
-            int batchSize = 10;
+            int batchSize = 5; // 2 args per symbol (orderbook + trade), Bybit limit 10 args per message
             for (int i = 0; i < symbols.size(); i += batchSize) {
                 int end = Math.min(i + batchSize, symbols.size());
                 List<String> batch = symbols.subList(i, end);
@@ -238,6 +238,11 @@ public class BybitSpotConnector extends AbstractWebSocketConnector {
             result.add(List.of(level.get(0).asText(), level.get(1).asText()));
         }
         return result;
+    }
+
+    @Override
+    protected int getResubscribeBatchSize() {
+        return 5; // 2 args per symbol, Bybit limit 10 args per message
     }
 
     @Override

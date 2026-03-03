@@ -359,8 +359,32 @@ public abstract class AbstractWebSocketConnector implements ExchangeConnector {
                 if (response.isSuccessful()) {
                     return response;
                 }
+                int code = response.code();
+                if (code == 429) {
+                    long waitMs = retryDelayMs;
+                    String retryAfter = response.header("Retry-After");
+                    if (retryAfter != null) {
+                        try {
+                            waitMs = Math.max(Long.parseLong(retryAfter) * 1000, retryDelayMs);
+                        } catch (NumberFormatException ignored) {}
+                    } else {
+                        waitMs = Math.max(retryDelayMs * (1L << attempt), 5000);
+                    }
+                    log.warn("[{}:{}] Rate limited (429), waiting {}ms before retry {}/{}",
+                            getExchange(), getMarketType(), waitMs, attempt, maxRetries);
+                    response.close();
+                    if (attempt < maxRetries) {
+                        try {
+                            Thread.sleep(waitMs);
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                            throw new IOException("Interrupted during 429 backoff", ie);
+                        }
+                    }
+                    continue;
+                }
                 log.warn("[{}:{}] HTTP request failed with code {}, attempt {}/{}",
-                        getExchange(), getMarketType(), response.code(), attempt, maxRetries);
+                        getExchange(), getMarketType(), code, attempt, maxRetries);
                 response.close();
             } catch (IOException e) {
                 lastException = e;
