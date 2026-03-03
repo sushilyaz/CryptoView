@@ -38,6 +38,7 @@ public class BinanceFuturesConnector extends AbstractWebSocketConnector {
     private static final long PUBLISH_THROTTLE_MS = 2000; // publish orderbook max once per 2 sec per symbol
     private static final int MAX_SYMBOLS = 512; // 1024 streams / 2 streams per symbol
     private static final int MAX_GAP_RETRIES = 3;
+    private static final int MAX_PENDING_BUFFER_SIZE = 500; // safety limit for pending bridging buffer
 
     private final Map<String, LocalOrderBook> localBooks = new ConcurrentHashMap<>();
     private final Map<String, Queue<JsonNode>> eventBuffers = new ConcurrentHashMap<>();
@@ -47,6 +48,9 @@ public class BinanceFuturesConnector extends AbstractWebSocketConnector {
     private final Set<String> refetchPending = ConcurrentHashMap.newKeySet();
     private final Map<String, AtomicInteger> gapRetryCounts = new ConcurrentHashMap<>();
     private final Map<String, AtomicInteger> gapCounts = new ConcurrentHashMap<>();
+    // Pending bridging: symbols that got snapshot but bridging event not yet in buffer
+    // Key = symbol, Value = snapshotLastUpdateId
+    private final Map<String, Long> pendingBridging = new ConcurrentHashMap<>();
     private volatile CountDownLatch initLatch = new CountDownLatch(1);
 
     private volatile Thread refetchWorkerThread;
@@ -123,6 +127,7 @@ public class BinanceFuturesConnector extends AbstractWebSocketConnector {
         gapRetryCounts.clear();
         refetchPending.clear();
         refetchQueue.clear();
+        pendingBridging.clear();
         for (String symbol : subscribedSymbols) {
             LocalOrderBook book = localBooks.get(symbol);
             if (book != null) {
@@ -236,96 +241,137 @@ public class BinanceFuturesConnector extends AbstractWebSocketConnector {
             LocalOrderBook book = localBooks.computeIfAbsent(symbol, LocalOrderBook::new);
             book.applySnapshot(bids, asks, lastUpdateId);
 
-            // Phase 1: Drain buffer while initializing flag is set
-            // handleDepthUpdate sees initializing=true → adds to buffer (not lost)
-            // Buffer stays in map — we use get(), not remove()
-            Queue<JsonNode> buffer = eventBuffers.get(symbol);
-            int bufferSize = buffer != null ? buffer.size() : 0;
-            int skipped = 0;
-            int applied = 0;
-            boolean foundFirst = false;
+            // Try to find bridging event in buffer and apply chain
+            if (tryDrainBuffer(symbol, book, lastUpdateId)) {
+                // Bridging found and buffer drained successfully
+                // Now transition to runtime: remove initializing, drain tail, cleanup
+                initializing.remove(symbol);
 
-            if (buffer != null) {
-                long prevU = lastUpdateId;
-                JsonNode event;
-
-                while ((event = buffer.poll()) != null) {
-                    long u = event.get("u").asLong();
-                    long U = event.get("U").asLong();
-                    long pu = event.has("pu") ? event.get("pu").asLong() : -1;
-
-                    if (u < lastUpdateId) {
-                        skipped++;
-                        continue;
-                    }
-
-                    if (!foundFirst) {
-                        if (U <= lastUpdateId && u >= lastUpdateId) {
-                            foundFirst = true;
-                            prevU = u;
-                            applyDiffEvent(book, event);
-                            applied++;
-                            continue;
-                        } else {
-                            skipped++;
-                            continue;
+                // Drain tail events that arrived between buffer drain and initializing.remove
+                Queue<JsonNode> buffer = eventBuffers.get(symbol);
+                int tailApplied = 0;
+                if (buffer != null) {
+                    JsonNode tailEvent;
+                    while ((tailEvent = buffer.poll()) != null) {
+                        long u = tailEvent.get("u").asLong();
+                        if (u <= book.getLastUpdateId()) continue;
+                        long pu = tailEvent.has("pu") ? tailEvent.get("pu").asLong() : -1;
+                        if (pu != -1 && pu != book.getLastUpdateId()) {
+                            log.warn("[BINANCE:FUTURES] Gap in tail for {} (pu={}, expected={}), re-queuing",
+                                    symbol, pu, book.getLastUpdateId());
+                            book.reset();
+                            eventBuffers.remove(symbol);
+                            queueRefetch(symbol);
+                            return;
                         }
+                        applyDiffEvent(book, tailEvent);
+                        tailApplied++;
                     }
-
-                    if (pu != -1 && pu != prevU) {
-                        log.warn("[BINANCE:FUTURES] Gap in buffered events for {} (pu={}, expectedPu={}, bufSize={}, skipped={}, applied={}), re-queuing",
-                                symbol, pu, prevU, bufferSize, skipped, applied);
-                        book.reset();
-                        eventBuffers.remove(symbol);
-                        initializing.remove(symbol);
-                        queueRefetch(symbol);
-                        return;
-                    }
-
-                    applyDiffEvent(book, event);
-                    applied++;
-                    prevU = u;
                 }
+                eventBuffers.remove(symbol);
+                pendingBridging.remove(symbol);
+                publishOrderBook(symbol, book);
+                gapRetryCounts.remove(symbol);
+                log.info("[BINANCE:FUTURES] Initialized {} (snapshotId={}, tail={}, bookLastId={})",
+                        symbol, lastUpdateId, tailApplied, book.getLastUpdateId());
+            } else {
+                // Bridging event NOT in buffer yet — keep initializing, let handleDepthUpdate find it
+                pendingBridging.put(symbol, lastUpdateId);
+                log.debug("[BINANCE:FUTURES] {} waiting for bridging event (snapshotId={})", symbol, lastUpdateId);
             }
-
-            // Phase 2: Remove initializing flag — handleDepthUpdate now goes to runtime path
-            initializing.remove(symbol);
-
-            // Phase 3: Drain any events that arrived between phase 1 drain and initializing.remove
-            // These events were added by handleDepthUpdate while initializing was still true
-            int tailApplied = 0;
-            if (buffer != null) {
-                JsonNode tailEvent;
-                while ((tailEvent = buffer.poll()) != null) {
-                    long u = tailEvent.get("u").asLong();
-                    if (u <= book.getLastUpdateId()) continue;
-                    long pu = tailEvent.has("pu") ? tailEvent.get("pu").asLong() : -1;
-                    if (pu != -1 && pu != book.getLastUpdateId()) {
-                        log.warn("[BINANCE:FUTURES] Gap in tail events for {} (pu={}, expected={}, tailApplied={}), re-queuing",
-                                symbol, pu, book.getLastUpdateId(), tailApplied);
-                        book.reset();
-                        eventBuffers.remove(symbol);
-                        queueRefetch(symbol);
-                        return;
-                    }
-                    applyDiffEvent(book, tailEvent);
-                    tailApplied++;
-                }
-            }
-
-            // Cleanup buffer entry
-            eventBuffers.remove(symbol);
-
-            publishOrderBook(symbol, book);
-            gapRetryCounts.remove(symbol);
-
-            log.info("[BINANCE:FUTURES] Initialized {} (snapshotId={}, buf={}, skipped={}, applied={}, tail={}, bridging={}, bookLastId={})",
-                    symbol, lastUpdateId, bufferSize, skipped, applied, tailApplied, foundFirst, book.getLastUpdateId());
         } catch (IOException e) {
             log.error("[BINANCE:FUTURES] Snapshot fetch failed for {}: {}", symbol, e.getMessage());
             initializing.remove(symbol);
             eventBuffers.remove(symbol);
+            pendingBridging.remove(symbol);
         }
+    }
+
+    /**
+     * Try to find bridging event in buffer and drain all applicable events.
+     * Bridging event for Futures: U <= lastUpdateId AND u >= lastUpdateId.
+     * Returns true if bridging was found and chain applied, false if bridging not yet in buffer.
+     */
+    private boolean tryDrainBuffer(String symbol, LocalOrderBook book, long snapshotLastUpdateId) {
+        Queue<JsonNode> buffer = eventBuffers.get(symbol);
+        if (buffer == null || buffer.isEmpty()) return false;
+
+        // Collect all events from buffer into a list for scanning
+        List<JsonNode> events = new ArrayList<>();
+        JsonNode event;
+        while ((event = buffer.poll()) != null) {
+            events.add(event);
+        }
+
+        // Find bridging event index
+        int bridgingIdx = -1;
+        boolean allTooNew = false;
+        for (int i = 0; i < events.size(); i++) {
+            JsonNode e = events.get(i);
+            long u = e.get("u").asLong();
+            long U = e.get("U").asLong();
+            if (u < snapshotLastUpdateId) continue; // too old, skip
+            if (U <= snapshotLastUpdateId && u >= snapshotLastUpdateId) {
+                bridgingIdx = i;
+                break;
+            }
+            if (U > snapshotLastUpdateId) {
+                // Passed the snapshot point without finding bridging — bridging is lost
+                allTooNew = true;
+                break;
+            }
+        }
+
+        if (bridgingIdx == -1) {
+            if (allTooNew) {
+                // Bridging event will never come — all buffered events are newer than snapshot
+                // Need to re-fetch snapshot
+                log.warn("[BINANCE:FUTURES] {} bridging lost (all events newer than snapshotId={}), re-queuing",
+                        symbol, snapshotLastUpdateId);
+                LocalOrderBook book2 = localBooks.get(symbol);
+                if (book2 != null) book2.reset();
+                eventBuffers.remove(symbol);
+                initializing.remove(symbol);
+                pendingBridging.remove(symbol);
+                queueRefetch(symbol);
+                return true; // handled via re-queue
+            }
+            // No bridging found yet — put events back into buffer for later
+            for (JsonNode e : events) {
+                buffer.add(e);
+            }
+            return false;
+        }
+
+        // Apply bridging event and all subsequent events with valid pu chain
+        long prevU = snapshotLastUpdateId;
+        int applied = 0;
+        for (int i = bridgingIdx; i < events.size(); i++) {
+            JsonNode e = events.get(i);
+            long u = e.get("u").asLong();
+            long pu = e.has("pu") ? e.get("pu").asLong() : -1;
+
+            if (i > bridgingIdx) {
+                // After bridging, validate pu chain
+                if (pu != -1 && pu != prevU) {
+                    log.warn("[BINANCE:FUTURES] Gap in buffer chain for {} at event #{} (pu={}, expected={}), re-queuing",
+                            symbol, i, pu, prevU);
+                    book.reset();
+                    eventBuffers.remove(symbol);
+                    initializing.remove(symbol);
+                    pendingBridging.remove(symbol);
+                    queueRefetch(symbol);
+                    return true; // return true because we handled it (via re-queue)
+                }
+            }
+
+            applyDiffEvent(book, e);
+            prevU = u;
+            applied++;
+        }
+
+        log.debug("[BINANCE:FUTURES] {} buffer drained: skipped={}, applied={}", symbol, bridgingIdx, applied);
+        return true;
     }
 
     private void queueRefetch(String symbol) {
@@ -450,11 +496,76 @@ public class BinanceFuturesConnector extends AbstractWebSocketConnector {
     }
 
     private void handleDepthUpdate(JsonNode data, String symbol) {
-        // If initializing — buffer the event
+        // If initializing — buffer the event, then try bridging if pending
         if (initializing.contains(symbol)) {
             Queue<JsonNode> buffer = eventBuffers.get(symbol);
             if (buffer != null) {
                 buffer.add(data);
+            }
+
+            // If we have a snapshot but are waiting for bridging event, check if THIS event is bridging
+            Long snapshotId = pendingBridging.get(symbol);
+            if (snapshotId != null) {
+                long u = data.get("u").asLong();
+                long U = data.get("U").asLong();
+
+                // Check if current event could be or contain bridging
+                boolean couldBeBridging = (U <= snapshotId && u >= snapshotId);
+                boolean passedBridgingPoint = (U > snapshotId);
+
+                if (couldBeBridging || passedBridgingPoint) {
+                    LocalOrderBook book = localBooks.get(symbol);
+                    if (book != null && book.isInitialized()) {
+                        // Safety: if buffer is too large, re-snapshot
+                        if (buffer != null && buffer.size() > MAX_PENDING_BUFFER_SIZE) {
+                            log.warn("[BINANCE:FUTURES] {} pending buffer overflow ({}), re-queuing snapshot",
+                                    symbol, buffer.size());
+                            book.reset();
+                            eventBuffers.remove(symbol);
+                            pendingBridging.remove(symbol);
+                            queueRefetch(symbol);
+                            return;
+                        }
+
+                        if (tryDrainBuffer(symbol, book, snapshotId)) {
+                            // Bridging found or handled (re-queued)!
+                            // Check if we actually transitioned (book still initialized = success)
+                            if (!book.isInitialized()) {
+                                // tryDrainBuffer reset the book and re-queued — we're done
+                                return;
+                            }
+                            // Transition to runtime
+                            initializing.remove(symbol);
+
+                            // Drain tail
+                            Queue<JsonNode> buf = eventBuffers.get(symbol);
+                            if (buf != null) {
+                                JsonNode tailEvent;
+                                while ((tailEvent = buf.poll()) != null) {
+                                    long tu = tailEvent.get("u").asLong();
+                                    if (tu <= book.getLastUpdateId()) continue;
+                                    long tpu = tailEvent.has("pu") ? tailEvent.get("pu").asLong() : -1;
+                                    if (tpu != -1 && tpu != book.getLastUpdateId()) {
+                                        log.warn("[BINANCE:FUTURES] Gap in tail for {} after bridging (pu={}, expected={}), re-queuing",
+                                                symbol, tpu, book.getLastUpdateId());
+                                        book.reset();
+                                        eventBuffers.remove(symbol);
+                                        pendingBridging.remove(symbol);
+                                        queueRefetch(symbol);
+                                        return;
+                                    }
+                                    applyDiffEvent(book, tailEvent);
+                                }
+                            }
+                            eventBuffers.remove(symbol);
+                            pendingBridging.remove(symbol);
+                            publishOrderBook(symbol, book);
+                            gapRetryCounts.remove(symbol);
+                            log.info("[BINANCE:FUTURES] Initialized {} via WS bridging (snapshotId={}, bookLastId={})",
+                                    symbol, snapshotId, book.getLastUpdateId());
+                        }
+                    }
+                }
             }
             return;
         }
@@ -466,29 +577,28 @@ public class BinanceFuturesConnector extends AbstractWebSocketConnector {
         }
 
         long u = data.get("u").asLong();
-        // Futures uses pu (previous update id) for continuity chain
         long pu = data.has("pu") ? data.get("pu").asLong() : -1;
 
-        // Skip already applied (stale) events FIRST — before gap detection
+        // Skip already applied (stale) events
         if (u <= book.getLastUpdateId()) {
             return;
         }
 
-        // Gap detection: pu should equal book's last update id (only for future events)
+        // Gap detection: pu should equal book's last update id
         if (pu != -1 && pu != book.getLastUpdateId()) {
             int gapCount = gapCounts.computeIfAbsent(symbol, k -> new AtomicInteger(0)).incrementAndGet();
             log.warn("[BINANCE:FUTURES] Gap #{} for {} (expected pu={}, got pu={}, u={}, delta={}), queuing refetch",
                     gapCount, symbol, book.getLastUpdateId(), pu, u, Math.abs(book.getLastUpdateId() - pu));
             book.reset();
             initializing.add(symbol);
-            Queue<JsonNode> buffer = new ConcurrentLinkedQueue<>();
-            buffer.add(data);
-            eventBuffers.put(symbol, buffer);
+            Queue<JsonNode> buf = new ConcurrentLinkedQueue<>();
+            buf.add(data);
+            eventBuffers.put(symbol, buf);
             queueRefetch(symbol);
             return;
         }
 
-        // Apply delta — always keep local book up-to-date
+        // Apply delta
         applyDiffEvent(book, data);
         incrementOrderbookUpdates();
 
@@ -572,11 +682,11 @@ public class BinanceFuturesConnector extends AbstractWebSocketConnector {
         int initialized = countInitializedBooks();
         int totalGaps = gapCounts.values().stream().mapToInt(AtomicInteger::get).sum();
         long exhausted = gapRetryCounts.values().stream().filter(c -> c.get() > MAX_GAP_RETRIES).count();
-        return String.format("msgs=%d, errs=%d, ob=%d, trades=%d, last=%s, syms=%d, books=%d/%d, gaps=%d, refetchQ=%d, pendingRefetch=%d, exhausted=%d",
+        return String.format("msgs=%d, errs=%d, ob=%d, trades=%d, last=%s, syms=%d, books=%d/%d, gaps=%d, refetchQ=%d, pendingRefetch=%d, pendingBridging=%d, exhausted=%d",
                 messagesReceived.get(), messageErrors.get(),
                 orderbookUpdates.get(), tradeUpdates.get(),
                 lastMsgStr, subscribedSymbols.size(),
                 initialized, localBooks.size(), totalGaps, refetchQueue.size(),
-                refetchPending.size(), exhausted);
+                refetchPending.size(), pendingBridging.size(), exhausted);
     }
 }
