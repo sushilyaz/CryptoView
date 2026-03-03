@@ -24,7 +24,8 @@ export function useWebSocket() {
       unsubStatus()
       wsClient.disconnect()
     }
-  }, [])  // подключаемся один раз при монтировании
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])  // подключаемся один раз при монтировании, setDensities/setConnected стабильны (zustand)
 
   // При смене активного workspace — переключаем WS без переподключения
   useEffect(() => {

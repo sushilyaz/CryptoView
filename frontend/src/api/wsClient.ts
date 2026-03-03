@@ -46,12 +46,16 @@ class DensityWebSocketClient {
   }
 
   private doConnect() {
-    const url = this.workspaceId
-      ? `/ws/densities?workspaceId=${this.workspaceId}`
-      : '/ws/densities'
+    const params = this.workspaceId
+      ? `?workspaceId=${this.workspaceId}`
+      : ''
 
-    // Vite proxy передаёт /ws/* на бэкенд, но URL для WS должен быть ws://
-    const wsUrl = `ws://${window.location.host}${url}`
+    // В dev-режиме подключаемся напрямую к бэкенду (порт 8080),
+    // в production — к тому же хосту
+    const host = window.location.port === '3000'
+      ? `${window.location.hostname}:8080`
+      : window.location.host
+    const wsUrl = `ws://${host}/ws/densities${params}`
 
     this.ws = new WebSocket(wsUrl)
 

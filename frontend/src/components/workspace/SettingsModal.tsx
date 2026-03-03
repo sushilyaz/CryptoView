@@ -128,32 +128,18 @@ export function SettingsModal() {
           />
         </div>
 
-        {/* Сортировка + Расстояние */}
-        <div className="grid grid-cols-2 gap-4">
-          <div>
-            <label className="block text-sm text-gray-400 mb-1">Сортировка</label>
-            <select
-              value={draft.sortType}
-              onChange={e => setDraft({ ...draft, sortType: e.target.value as DensitySortType })}
-              className="w-full px-3 py-2 bg-[#0f1117] border border-[#2d3748] rounded-lg text-white text-sm focus:outline-none focus:border-blue-500"
-            >
-              {SORT_OPTIONS.map(o => (
-                <option key={o.value} value={o.value}>{o.label}</option>
-              ))}
-            </select>
-          </div>
-          <div>
-            <label className="block text-sm text-gray-400 mb-1">Макс. расстояние от спреда, %</label>
-            <input
-              type="number"
-              value={draft.maxDistancePercent}
-              onChange={e => setDraft({ ...draft, maxDistancePercent: parseFloat(e.target.value) || 10 })}
-              min={0.1}
-              max={50}
-              step={0.1}
-              className="w-full px-3 py-2 bg-[#0f1117] border border-[#2d3748] rounded-lg text-white text-sm focus:outline-none focus:border-blue-500"
-            />
-          </div>
+        {/* Сортировка */}
+        <div>
+          <label className="block text-sm text-gray-400 mb-1">Сортировка</label>
+          <select
+            value={draft.sortType}
+            onChange={e => setDraft({ ...draft, sortType: e.target.value as DensitySortType })}
+            className="w-full px-3 py-2 bg-[#0f1117] border border-[#2d3748] rounded-lg text-white text-sm focus:outline-none focus:border-blue-500"
+          >
+            {SORT_OPTIONS.map(o => (
+              <option key={o.value} value={o.value}>{o.label}</option>
+            ))}
+          </select>
         </div>
 
         {/* NEW бейдж таймер */}

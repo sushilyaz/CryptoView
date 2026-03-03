@@ -16,7 +16,6 @@ export interface Workspace {
   symbolComments: Record<string, string>
   sortType: DensitySortType
   newBadgeDurationMinutes: number               // сколько минут показывать NEW
-  maxDistancePercent: number
 }
 
 export interface WorkspaceRequest {
@@ -29,5 +28,4 @@ export interface WorkspaceRequest {
   symbolComments: Record<string, string>
   sortType: DensitySortType
   newBadgeDurationMinutes: number
-  maxDistancePercent: number
 }
