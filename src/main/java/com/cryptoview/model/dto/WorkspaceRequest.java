@@ -11,10 +11,12 @@ public record WorkspaceRequest(
         Set<String> enabledMarkets,
         Map<String, BigDecimal> minDensityOverrides,
         Map<String, BigDecimal> symbolMinDensityOverrides,
+        Map<String, BigDecimal> symbolMarketMinDensityOverrides,
         Set<String> blacklistedSymbols,
         Set<String> favoritedSymbols,
         Map<String, String> symbolComments,
         DensitySortType sortType,
-        Integer newBadgeDurationMinutes
+        Integer newBadgeDurationMinutes,
+        Boolean tsMode
 ) {
 }

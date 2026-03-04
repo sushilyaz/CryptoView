@@ -86,6 +86,8 @@ public class WorkspaceService {
         existing.setSymbolComments(updated.getSymbolComments());
         existing.setSortType(updated.getSortType());
         existing.setNewBadgeDurationMinutes(updated.getNewBadgeDurationMinutes());
+        existing.setSymbolMarketMinDensityOverrides(updated.getSymbolMarketMinDensityOverrides());
+        existing.setTsMode(updated.isTsMode());
 
         saveToFile();
         return Optional.of(existing);

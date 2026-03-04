@@ -20,6 +20,7 @@ public record DensityResponse(
         Instant firstSeenAt,
         Instant lastSeenAt,
         long durationSeconds,
-        String comment
+        String comment,
+        BigDecimal volume15min
 ) {
 }

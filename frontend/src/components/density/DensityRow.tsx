@@ -1,6 +1,6 @@
 import type { DensityItem } from '../../types/density'
 import { EXCHANGE_COLORS } from '../../utils/constants'
-import { formatVolumeUsd, formatPrice, formatDistance, isNew } from '../../utils/formatters'
+import { formatVolumeUsd, formatPrice, formatDistance, formatDuration, isNew } from '../../utils/formatters'
 import { Badge } from '../common/Badge'
 
 interface DensityRowProps {
@@ -42,6 +42,11 @@ export function DensityRow({ density, newBadgeMinutes }: DensityRowProps) {
       {/* Расстояние */}
       <span className="text-xs text-gray-400 w-14 shrink-0">
         {formatDistance(density.distancePercent)}
+      </span>
+
+      {/* Время жизни */}
+      <span className="text-xs text-gray-500 w-14 shrink-0">
+        {formatDuration(density.durationSeconds)}
       </span>
 
       {/* NEW бейдж */}

@@ -50,6 +50,18 @@ public class Workspace {
     private DensitySortType sortType = DensitySortType.SIZE_USD_DESC;
 
     /**
+     * Min density overrides per symbol per exchange+marketType.
+     * Key format: "SYMBOL_EXCHANGE_MARKETTYPE" (e.g., "BTCUSDT_BINANCE_SPOT").
+     */
+    private Map<String, BigDecimal> symbolMarketMinDensityOverrides = new HashMap<>();
+
+    /**
+     * Trading strategy mode: when true, additionally filters densities
+     * where volumeUsd > volume15min.
+     */
+    private boolean tsMode = false;
+
+    /**
      * How long (in minutes) a density is marked as NEW after first seen.
      * Frontend-only hint, not used by backend filtering.
      */

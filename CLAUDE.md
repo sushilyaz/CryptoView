@@ -73,16 +73,19 @@ Workspaces — view-layer фильтр. Они **НЕ влияют** на alert 
 - `enabledMarkets` — включённые exchange+marketType пары (пусто = все)
 - `minDensityOverrides` — минимальный порог по exchange+marketType
 - `symbolMinDensityOverrides` — минимальный порог по символу
+- `symbolMarketMinDensityOverrides` — минимальный порог по символу+биржа+рынок (ключ `"ETHUSDT_BINANCE_SPOT"`)
 - `blacklistedSymbols` — скрытые символы
-- `favoritedSymbols` — символы в избранном (отображаются первыми)
+- `favoritedSymbols` — символы в избранном (хранятся базовые тикеры: ETH, BTC)
 - `symbolComments` — пользовательские комментарии к символам
 - `sortType` — сортировка densities (DURATION_DESC, SIZE_USD_DESC, DISTANCE_ASC)
 - `newBadgeDurationMinutes` — сколько минут плотность помечается как NEW (дефолт: 5)
+- `tsMode` — режим ТС: фильтрует плотности где volumeUsd > volume15min (доступен после 15 мин работы)
 
-### Приоритет resolveMinDensity
-1. `workspace.symbolMinDensityOverrides[symbol]`
-2. `workspace.minDensityOverrides[exchange_marketType]`
-3. `configService.getEffectiveConfig()` из application.yml
+### Приоритет resolveMinDensity (4 уровня)
+1. `workspace.symbolMarketMinDensityOverrides[symbol_exchange_marketType]`
+2. `workspace.symbolMinDensityOverrides[symbol]`
+3. `workspace.minDensityOverrides[exchange_marketType]`
+4. `configService.getEffectiveConfig()` из application.yml
 
 ### Хранение
 In-memory + `workspaces.json` (переживает рестарт). Tracked densities — только в памяти.
@@ -140,7 +143,7 @@ densitiesByOrderBookKey: ConcurrentHashMap<"EXCHANGE_MARKETTYPE_SYMBOL", Set<tra
 ### Status
 | Method | Path | Описание |
 |--------|------|----------|
-| GET | `/api/v1/status` | connectedExchanges, totalSymbols, trackedDensities, activeWorkspace |
+| GET | `/api/v1/status` | connectedExchanges, totalSymbols, trackedDensities, activeWorkspace, volumeTrackingReady, appUptimeSeconds |
 
 ## WebSocket API
 
@@ -174,6 +177,7 @@ ws://localhost:8080/ws/densities?workspaceId=<uuid>
     "firstSeenAt": "2026-02-22T11:55:00Z",
     "lastSeenAt": "2026-02-22T12:00:00Z",
     "durationSeconds": 300,
+    "volume15min": 5000000.00,
     "comment": "крупный бид"
   }]
 }
@@ -293,27 +297,39 @@ cd frontend && npm run build
 
 ## Текущее состояние проекта
 
-### Бэкенд — рабочий
+### Бэкенд — полностью рабочий
 - Все коннекторы работают (кроме Gate и Lighter — отключены)
 - Alert pipeline → Telegram работает
 - Density tracking pipeline → REST + WebSocket работает
-- Workspaces: CRUD, export/import, favoritedSymbols, newBadgeDurationMinutes — всё реализовано
+- Workspaces: CRUD, export/import, favoritedSymbols, newBadgeDurationMinutes, tsMode, symbolMarketMinDensityOverrides
+- DensityFilterService: ТС фильтр (volumeUsd > volume15min), 4-уровневый resolveMinDensity
+- VolumeTracker: `isVolumeDataReady()` (15 мин uptime), `getUptimeSeconds()`
+- StatusController: volumeTrackingReady, appUptimeSeconds
+- DensityResponse: включает volume15min
 - Binance snapshot storm пофикшен (последовательная инициализация)
 
-### Фронтенд — базовый каркас, НЕ ТЕСТИРОВАЛСЯ С БЭКЕНДОМ
-Создана полная структура React-приложения, компилируется чисто (`npm run build` — OK).
-Компоненты написаны, но **ещё не проверялись вместе с работающим бэкендом**.
+### Фронтенд — рабочий, протестирован с бэкендом
+Все критические баги исправлены, плотности отображаются в реальном времени.
 
-Потенциальные проблемы, которые нужно будет отладить при первом запуске:
-- Маппинг `enabledMarkets`: фронтенд отправляет `ExchangeMarketKey[]` (объекты `{exchange, marketType}`), бэкенд хранит `Set<String>` (ключи `"BINANCE_SPOT"`) — нужно проверить сериализацию/десериализацию
-- WebSocket подключение через Vite proxy — нужно убедиться что `/ws/densities` проксируется корректно
-- Workspace `maxDistancePercent` — есть на фронтенде в типе `Workspace`, но отсутствует в бэкенде `Workspace.java`
-- Обработка ответа `del<void>` в `httpClient.ts` — при 204 No Content `res.json()` бросит ошибку
-- `SettingsModal` отправляет `WorkspaceRequest` с `enabledMarkets` как массив объектов, а бэкенд ожидает `Set<String>`
+**Исправленные проблемы:**
+- `enabledMarkets` конвертация: `httpClient.ts` конвертирует `ExchangeMarketKey[]` ↔ `string[]` автоматически
+- WS подключение: напрямую к `ws://localhost:8080` (Vite WS proxy конфликтовал с HMR)
+- 204 No Content: `parseBody()` в httpClient обрабатывает пустые ответы
+- `maxDistancePercent` удалён из фронтенда (нет на бэкенде)
+- Zustand reactivity: компоненты подписаны на `displayedDensities`, группировка через `useMemo`
+
+**Реализованные фичи фронтенда:**
+- Freeze on hover — UI замирает при наведении курсора на сетку
+- Группировка по базовому тикеру (ETH с разных бирж в одной карточке)
+- Избранное по базовым тикерам (ETH, BTC)
+- ТС тумблер в Header (доступен после 15 мин, поллинг statusApi)
+- Inner sort в Header (расстояние / объём / время)
+- Per-symbol-per-market min density overrides в SymbolSettingsPopup
+- Duration в каждой строке плотности
 
 ### Запуск для разработки
 1. Бэкенд: `./gradlew bootRun` (порт 8080). Ждёт 1-2 мин для подключения к биржам.
-2. Фронтенд: `cd frontend && npm run dev` (порт 3000). Vite proxy → 8080.
+2. Фронтенд: `cd frontend && npm run dev` (порт 3000). Vite proxy `/api` → 8080, WS напрямую к 8080.
 3. Открыть `http://localhost:3000`
 
 ## TODO
@@ -333,7 +349,11 @@ cd frontend && npm run build
 - [x] Workspace: поля favoritedSymbols и newBadgeDurationMinutes
 - [x] Workspace: export/import эндпоинты
 - [x] Fix Binance snapshot storm (последовательная инициализация)
-- [ ] **Frontend: первый запуск и отладка с бэкендом** (маппинг enabledMarkets, WS proxy, 204 ответы)
+- [x] Frontend: отладка с бэкендом (enabledMarkets, WS proxy, 204 ответы)
+- [x] Frontend: freeze on hover, группировка по тикеру, inner sort
+- [x] Frontend: ТС режим (tsMode + volume15min + volumeTrackingReady)
+- [x] Frontend: per-symbol-per-market min density overrides
+- [x] Frontend: duration в DensityRow, избранное по базовому тикеру
 - [ ] Frontend: иконки бирж (SVG в public/icons/)
 - [ ] Frontend: полировка UI, анимации появления новых плотностей
 - [ ] Frontend: управление несколькими workspaces из UI
@@ -501,7 +521,7 @@ com.cryptoview
 ```
 frontend/
 ├── package.json              # Зависимости (React, Vite, Tailwind, Zustand)
-├── vite.config.ts            # Vite конфиг: proxy /api → 8080, /ws → 8080
+├── vite.config.ts            # Vite конфиг: proxy /api → 8080 (WS proxy отключён)
 ├── tsconfig.json             # TypeScript конфиг
 ├── index.html                # HTML точка входа
 ├── public/
@@ -512,11 +532,11 @@ frontend/
     ├── index.css             # Tailwind import + глобальные стили (тёмная тема)
     ├── api/
     │   ├── httpClient.ts     # REST API клиент (workspaceApi, symbolApi, densityApi, statusApi)
-    │   └── wsClient.ts       # WebSocket синглтон с авторекконектом
+    │   └── wsClient.ts       # WebSocket синглтон (dev: прямое подключение к :8080)
     ├── stores/
     │   ├── workspaceStore.ts # Zustand: workspaces, активный workspace, CRUD операции
-    │   ├── densityStore.ts   # Zustand: densities из WS, группировка по символу
-    │   └── uiStore.ts        # Zustand: состояние модалок (settings, blacklist, symbolSettings)
+    │   ├── densityStore.ts   # Zustand: densities + displayedDensities (freeze on hover)
+    │   └── uiStore.ts        # Zustand: модалки, innerSortType
     ├── hooks/
     │   └── useWebSocket.ts   # Подключение WS при монтировании, переключение workspace
     ├── types/
@@ -524,20 +544,20 @@ frontend/
     │   ├── workspace.ts      # Workspace, WorkspaceRequest, ExchangeMarketKey
     │   └── enums.ts          # Exchange, MarketType, Side, DensitySortType
     ├── utils/
-    │   ├── formatters.ts     # formatVolumeUsd, formatPrice, formatDuration, isNew
+    │   ├── formatters.ts     # formatVolumeUsd, formatPrice, formatDuration, isNew, getBaseTicker
     │   └── constants.ts      # EXCHANGE_LABELS, EXCHANGE_COLORS, DISABLED_MARKETS
     └── components/
         ├── layout/
-        │   └── Header.tsx           # Шапка: логотип, WS-индикатор, имя workspace, кнопки
+        │   └── Header.tsx           # Шапка: WS-индикатор, ТС тумблер, inner sort, workspace
         ├── density/
-        │   ├── DensityGrid.tsx      # Сетка карточек (responsive: 1-5 колонок)
-        │   ├── SymbolCard.tsx       # Карточка монеты: звёздочка, кнопки ЧС/настройки
-        │   └── DensityRow.tsx       # Строка плотности: биржа, объём, цена, расстояние, NEW
+        │   ├── DensityGrid.tsx      # Сетка карточек: группировка по тикеру, freeze on hover
+        │   ├── SymbolCard.tsx       # Карточка монеты: избранное, ЧС, inner sort, настройки
+        │   └── DensityRow.tsx       # Строка: биржа, объём, цена, расстояние, длительность, NEW
         ├── workspace/
         │   └── SettingsModal.tsx    # Модалка настроек workspace (биржи, сортировка, мин. размер)
         ├── symbol/
         │   ├── BlacklistPanel.tsx   # Модалка просмотра/управления ЧС
-        │   └── SymbolSettingsPopup.tsx  # Модалка настроек конкретной монеты
+        │   └── SymbolSettingsPopup.tsx  # Настройки монеты: комментарий, мин. плотность, per-market overrides
         └── common/
             ├── Modal.tsx            # Базовый компонент модального окна
             ├── Toggle.tsx           # Toggle switch (включить/отключить)
@@ -549,18 +569,38 @@ frontend/
 **Состояние и данные:**
 - Zustand store — единственный источник правды для workspace и densities
 - WS данные попадают в `densityStore` через `useWebSocket` хук
-- Группировка плотностей по символу — в `densityStore.getSymbolGroups()`, вызывается в `DensityGrid`
-- Избранные символы всегда первыми (сортировка в `getSymbolGroups`)
+- `densityStore` хранит `densities` (всегда обновляются) и `displayedDensities` (замирают при hover)
+- Группировка по базовому тикеру (`getBaseTicker()` strip USDT/USDC/USD) выполняется в `DensityGrid` через `useMemo`
+- Избранные хранятся как базовые тикеры (ETH, BTC), всегда первыми в сортировке
+- Inner sort (расстояние/объём/время) — глобальный контрол в Header, применяется в `SymbolCard` через `useMemo`
+
+**Freeze on hover:**
+- `onMouseEnter` → `setPaused(true)`, `onMouseLeave` → `setPaused(false)` на DensityGrid
+- Когда `isPaused=true`, `setDensities()` обновляет `densities` но НЕ `displayedDensities`
+- Компоненты рендерят `displayedDensities` → UI замирает пока курсор на сетке
 
 **Workspace:**
 - `updateActiveLocal(patch)` — оптимистичное локальное обновление без запроса
 - Сохранение через `update(id, req)` → PUT `/api/v1/workspaces/{id}`
 - Настройки символов сохраняются через отдельные API эндпоинты (`symbolApi.*`)
+- Per-symbol-per-market overrides сохраняются через PUT workspace (не отдельные эндпоинты)
+
+**ТС режим (Header):**
+- Тумблер "По ТС" / "Выкл" в Header, disabled пока `volumeTrackingReady=false`
+- Поллинг `statusApi` каждые 30 сек для проверки готовности (15 мин uptime)
+- Фильтрация на бэкенде: `DensityFilterService` пропускает только `volumeUsd > volume15min`
 
 **Типы данных фронтенд ↔ бэкенд:**
-- `enabledMarkets` на бэкенде — `Set<String>` (ключи типа `"BINANCE_SPOT"`), на фронтенде — `ExchangeMarketKey[]` с полями `exchange` и `marketType`
+- `enabledMarkets` на бэкенде — `Set<String>` (ключи типа `"BINANCE_SPOT"`), на фронтенде — `ExchangeMarketKey[]` с полями `exchange` и `marketType`. Конвертация в `httpClient.ts` (`marketsToBackend`/`marketsFromBackend`)
 - `minDensityOverrides` — ключи `"BINANCE_SPOT"`, значения числа
-- `favoritedSymbols` и `blacklistedSymbols` — массивы строк (символы)
+- `symbolMarketMinDensityOverrides` — ключи `"ETHUSDT_BINANCE_SPOT"`, значения числа
+- `favoritedSymbols` — массив базовых тикеров (ETH, BTC)
+- `blacklistedSymbols` — массив raw символов (ETHUSDT)
+
+**WebSocket подключение:**
+- В dev-режиме (port 3000) wsClient подключается напрямую к `ws://localhost:8080/ws/densities`
+- В production используется `window.location.host`
+- Vite proxy НЕ используется для WS (конфликтует с HMR)
 
 ## Исправленные баги (история)
 

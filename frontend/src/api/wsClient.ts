@@ -60,6 +60,7 @@ class DensityWebSocketClient {
     this.ws = new WebSocket(wsUrl)
 
     this.ws.onopen = () => {
+      console.log('[WS] connected to', wsUrl)
       this.reconnectDelay = 1000
       this.statusHandlers.forEach(h => h(true))
     }
@@ -68,14 +69,18 @@ class DensityWebSocketClient {
       try {
         const msg = JSON.parse(event.data) as WsDensitiesMessage
         if (msg.type === 'densities') {
+          console.log(`[WS] densities received: count=${msg.count}, handlers=${this.messageHandlers.size}`)
           this.messageHandlers.forEach(h => h(msg))
+        } else {
+          console.log('[WS] unknown message type:', msg)
         }
-      } catch {
-        // ignore malformed messages
+      } catch (e) {
+        console.error('[WS] parse error:', e, event.data?.slice?.(0, 200))
       }
     }
 
-    this.ws.onclose = () => {
+    this.ws.onclose = (ev) => {
+      console.log('[WS] disconnected, code:', ev.code, 'reason:', ev.reason)
       this.statusHandlers.forEach(h => h(false))
       if (this.shouldConnect) {
         this.reconnectTimer = setTimeout(() => {

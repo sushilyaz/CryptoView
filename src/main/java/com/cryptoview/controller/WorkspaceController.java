@@ -82,5 +82,7 @@ public class WorkspaceController {
         if (request.symbolComments() != null) ws.setSymbolComments(request.symbolComments());
         if (request.sortType() != null) ws.setSortType(request.sortType());
         if (request.newBadgeDurationMinutes() != null) ws.setNewBadgeDurationMinutes(request.newBadgeDurationMinutes());
+        if (request.symbolMarketMinDensityOverrides() != null) ws.setSymbolMarketMinDensityOverrides(request.symbolMarketMinDensityOverrides());
+        if (request.tsMode() != null) ws.setTsMode(request.tsMode());
     }
 }

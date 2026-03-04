@@ -120,6 +120,8 @@ export interface SystemStatus {
   totalSymbols: number
   trackedDensities: number
   activeWorkspace: string
+  volumeTrackingReady: boolean
+  appUptimeSeconds: number
 }
 
 export const statusApi = {

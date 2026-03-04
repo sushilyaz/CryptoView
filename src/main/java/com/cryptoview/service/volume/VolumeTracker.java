@@ -10,6 +10,7 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
 import java.math.BigDecimal;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Iterator;
@@ -24,6 +25,7 @@ public class VolumeTracker {
 
     private static final int WINDOW_MINUTES = 15;
 
+    private final Instant startedAt = Instant.now();
     private final Map<String, Queue<VolumeEntry>> volumeHistory = new ConcurrentHashMap<>();
 
     private record VolumeEntry(BigDecimal volumeUsd, Instant timestamp) {}
@@ -110,5 +112,13 @@ public class VolumeTracker {
 
     public int getTrackedSymbolsCount() {
         return volumeHistory.size();
+    }
+
+    public boolean isVolumeDataReady() {
+        return Duration.between(startedAt, Instant.now()).toMinutes() >= WINDOW_MINUTES;
+    }
+
+    public long getUptimeSeconds() {
+        return Duration.between(startedAt, Instant.now()).getSeconds();
     }
 }
