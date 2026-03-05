@@ -6,6 +6,8 @@ export type Exchange =
   | 'GATE'
   | 'MEXC'
   | 'HYPERLIQUID'
+  | 'LIGHTER'
+  | 'ASTER'
 
 export type MarketType = 'SPOT' | 'FUTURES'
 

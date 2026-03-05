@@ -126,4 +126,5 @@ export interface SystemStatus {
 
 export const statusApi = {
   get: () => get<SystemStatus>('/status'),
+  getMarketsForSymbol: (baseTicker: string) => get<string[]>(`/status/symbol/${baseTicker}/markets`),
 }

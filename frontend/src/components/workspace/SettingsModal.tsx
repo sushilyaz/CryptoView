@@ -19,7 +19,7 @@ const SORT_OPTIONS: { value: DensitySortType; label: string }[] = [
   { value: 'DISTANCE_ASC', label: 'По расстоянию ↑' },
 ]
 
-const ALL_EXCHANGES: Exchange[] = ['BINANCE', 'BYBIT', 'OKX', 'BITGET', 'GATE', 'MEXC', 'HYPERLIQUID']
+const ALL_EXCHANGES: Exchange[] = [...new Set([...EXCHANGES_WITH_SPOT, ...EXCHANGES_WITH_FUTURES])]
 
 export function SettingsModal() {
   const settingsOpen = useUiStore(s => s.settingsOpen)

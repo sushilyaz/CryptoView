@@ -1,0 +1,26 @@
+[ {
+  "id" : "cd0d463d-2975-4aaf-8ccb-422d88e446fb",
+  "name" : "Default",
+  "active" : true,
+  "enabledMarkets" : [ ],
+  "minDensityOverrides" : {
+    "BINANCE_SPOT" : 500000,
+    "BYBIT_SPOT" : 500000,
+    "BINANCE_FUTURES" : 500000,
+    "BYBIT_FUTURES" : 500000,
+    "OKX_FUTURES" : 500000,
+    "BITGET_FUTURES" : 500000,
+    "BITGET_SPOT" : 500000,
+    "OKX_SPOT" : 500000,
+    "MEXC_SPOT" : 500000,
+    "HYPERLIQUID_FUTURES" : 200000
+  },
+  "symbolMinDensityOverrides" : { },
+  "blacklistedSymbols" : [ "USDCUSDT", "SHIB1000USDT", "PAXGUSDT", "BTCUSDC", "SOLUSDC", "USDGUSDT", "SOLUSDT", "BTCUSDT", "ETHUSDC", "FDUSDUSDT", "UUSDT", "ADAUSDT", "USDPUSDT", "BNBUSDT", "TUSDUSDT", "XUSDUSDT", "BFUSDUSDT", "ZECUSDT", "XRPUSDT", "ETHUSDT", "RLUSDUSDT", "USDEUSDT", "DOGEUSDT", "USD1USDT", "AVAXUSDT" ],
+  "favoritedSymbols" : [ ],
+  "symbolComments" : { },
+  "sortType" : "DISTANCE_ASC",
+  "symbolMarketMinDensityOverrides" : { },
+  "tsMode" : false,
+  "newBadgeDurationMinutes" : 5
+} ]

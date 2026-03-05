@@ -11,6 +11,7 @@ interface DensityState {
   setDensities: (items: DensityItem[], timestamp: string) => void
   setConnected: (connected: boolean) => void
   setPaused: (paused: boolean) => void
+  removeSymbols: (rawSymbols: string[]) => void
 }
 
 export const useDensityStore = create<DensityState>((set, get) => ({
@@ -41,5 +42,14 @@ export const useDensityStore = create<DensityState>((set, get) => ({
     } else {
       set({ isPaused: true })
     }
+  },
+
+  removeSymbols: (rawSymbols) => {
+    const symbolSet = new Set(rawSymbols.map(s => s.toUpperCase()))
+    const { densities, displayedDensities } = get()
+    set({
+      densities: densities.filter(d => !symbolSet.has(d.symbol.toUpperCase())),
+      displayedDensities: displayedDensities.filter(d => !symbolSet.has(d.symbol.toUpperCase())),
+    })
   },
 }))

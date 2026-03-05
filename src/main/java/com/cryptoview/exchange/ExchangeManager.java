@@ -14,6 +14,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -145,6 +146,31 @@ public class ExchangeManager {
                 }
             }
         }
+    }
+
+    /**
+     * Возвращает список "EXCHANGE_MARKETTYPE" ключей, на которых данный символ подписан.
+     * Проверяет все варианты: ETHUSDT, ETHUSDC, ETH (Hyperliquid).
+     */
+    public List<String> getMarketsForSymbol(String baseTicker) {
+        String upper = baseTicker.toUpperCase();
+        List<String> suffixes = List.of("USDT", "USDC", "USD", "");
+        List<String> result = new ArrayList<>();
+
+        for (ExchangeConnector connector : connectors) {
+            if (!connector.isConnected()) continue;
+            var symbols = connector.getSubscribedSymbols();
+            for (String suffix : suffixes) {
+                String candidate = upper + suffix;
+                if (candidate.equals(upper) && !suffix.isEmpty()) continue; // skip "ETH" + non-empty (already handled by "")
+                if (symbols.contains(candidate) || symbols.contains(candidate.toLowerCase())) {
+                    result.add(buildKey(connector.getExchange(), connector.getMarketType()));
+                    break;
+                }
+            }
+        }
+
+        return result;
     }
 
     private String buildKey(Exchange exchange, MarketType marketType) {

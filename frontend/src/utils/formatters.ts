@@ -33,12 +33,13 @@ export function formatDuration(seconds: number): string {
   return `${minutes}m`
 }
 
-// Извлечь базовый тикер из символа: ETHUSDT → ETH, BTCUSDC → BTC
+// Извлечь базовый тикер из символа: ETHUSDT → ETH, BTCUSDC → BTC, ethusdc → ETH
 export function getBaseTicker(symbol: string): string {
-  if (symbol.endsWith('USDT')) return symbol.slice(0, -4)
-  if (symbol.endsWith('USDC')) return symbol.slice(0, -4)
-  if (symbol.endsWith('USD')) return symbol.slice(0, -3)
-  return symbol // Hyperliquid уже отправляет BTC, ETH
+  const s = symbol.toUpperCase()
+  if (s.endsWith('USDT')) return s.slice(0, -4)
+  if (s.endsWith('USDC')) return s.slice(0, -4)
+  if (s.endsWith('USD')) return s.slice(0, -3)
+  return s
 }
 
 // Является ли плотность "новой" (firstSeenAt в пределах newBadgeMinutes минут)

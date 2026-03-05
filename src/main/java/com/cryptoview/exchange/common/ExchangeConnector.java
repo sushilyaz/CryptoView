@@ -4,6 +4,7 @@ import com.cryptoview.model.enums.Exchange;
 import com.cryptoview.model.enums.MarketType;
 
 import java.util.List;
+import java.util.Set;
 
 public interface ExchangeConnector {
 
@@ -22,6 +23,8 @@ public interface ExchangeConnector {
     boolean isConnected();
 
     int getSubscribedSymbolsCount();
+
+    Set<String> getSubscribedSymbols();
 
     default String getStatusSummary() {
         return "symbols=" + getSubscribedSymbolsCount();

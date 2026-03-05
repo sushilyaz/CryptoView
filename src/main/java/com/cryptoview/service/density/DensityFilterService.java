@@ -13,6 +13,8 @@ import org.springframework.stereotype.Service;
 import java.math.BigDecimal;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
 
 @Service
 @RequiredArgsConstructor
@@ -23,11 +25,25 @@ public class DensityFilterService {
     private final VolumeTracker volumeTracker;
 
     public List<DensityResponse> filterDensities(Workspace ws, DensitySortType sortType, int limit) {
-        return densityTracker.getAllActiveDensities().stream()
+        // Базовая фильтрация: market, blacklist, minDensity
+        List<TrackedDensity> filtered = densityTracker.getAllActiveDensities().stream()
                 .filter(d -> isMarketEnabled(ws, d))
                 .filter(d -> !ws.getBlacklistedSymbols().contains(d.symbol().toUpperCase()))
                 .filter(d -> meetsMinDensity(ws, d))
-                .filter(d -> !ws.isTsMode() || meetsTsFilter(d))
+                .toList();
+
+        // ТС фильтр: если хоть одна плотность тикера проходит — показываем все плотности тикера
+        if (ws.isTsMode()) {
+            Set<String> qualifiedTickers = filtered.stream()
+                    .filter(this::meetsTsFilter)
+                    .map(d -> getBaseTicker(d.symbol()))
+                    .collect(Collectors.toSet());
+            filtered = filtered.stream()
+                    .filter(d -> qualifiedTickers.contains(getBaseTicker(d.symbol())))
+                    .toList();
+        }
+
+        return filtered.stream()
                 .sorted(getSorter(sortType))
                 .limit(limit)
                 .map(d -> toResponse(d, ws))
@@ -77,6 +93,14 @@ public class DensityFilterService {
             case SIZE_USD_DESC -> Comparator.comparing(TrackedDensity::volumeUsd).reversed();
             case DISTANCE_ASC -> Comparator.comparing(TrackedDensity::distancePercent);
         };
+    }
+
+    private static String getBaseTicker(String symbol) {
+        String upper = symbol.toUpperCase();
+        if (upper.endsWith("USDT")) return upper.substring(0, upper.length() - 4);
+        if (upper.endsWith("USDC")) return upper.substring(0, upper.length() - 4);
+        if (upper.endsWith("USD")) return upper.substring(0, upper.length() - 3);
+        return upper; // Hyperliquid: ETH, BTC
     }
 
     private DensityResponse toResponse(TrackedDensity d, Workspace ws) {

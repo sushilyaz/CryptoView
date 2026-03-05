@@ -3,6 +3,7 @@ import type { SymbolGroup } from '../../types/density'
 import { DensityRow } from './DensityRow'
 import { formatDuration } from '../../utils/formatters'
 import { useWorkspaceStore } from '../../stores/workspaceStore'
+import { useDensityStore } from '../../stores/densityStore'
 import { useUiStore } from '../../stores/uiStore'
 import { symbolApi } from '../../api/httpClient'
 
@@ -15,6 +16,7 @@ export function SymbolCard({ group, newBadgeMinutes }: SymbolCardProps) {
   const activeWorkspace = useWorkspaceStore(s => s.activeWorkspace)
   const update = useWorkspaceStore(s => s.update)
   const updateActiveLocal = useWorkspaceStore(s => s.updateActiveLocal)
+  const removeSymbols = useDensityStore(s => s.removeSymbols)
   const openSymbolSettings = useUiStore(s => s.openSymbolSettings)
   const innerSortType = useUiStore(s => s.innerSortType)
 
@@ -55,6 +57,8 @@ export function SymbolCard({ group, newBadgeMinutes }: SymbolCardProps) {
     try {
       // Бэкенд фильтрует по raw symbol — добавляем все варианты
       const rawSymbols = group.rawSymbols
+      // Немедленно убираем из отображения (даже на паузе)
+      removeSymbols(rawSymbols)
       for (const sym of rawSymbols) {
         await symbolApi.addBlacklist(activeWorkspace.id, sym)
       }

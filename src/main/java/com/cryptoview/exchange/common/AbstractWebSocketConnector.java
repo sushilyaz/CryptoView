@@ -47,9 +47,10 @@ public abstract class AbstractWebSocketConnector implements ExchangeConnector {
     protected ScheduledFuture<?> reconnectTask;
     protected ScheduledFuture<?> pingTask;
 
-    private static final int MAX_RECONNECT_ATTEMPTS = 10;
+    private static final int MAX_RECONNECT_ATTEMPTS = 10; // before switching to periodic reconnect
     private static final long INITIAL_RECONNECT_DELAY_MS = 1000;
     private static final long MAX_RECONNECT_DELAY_MS = 60000;
+    private static final long PERIODIC_RECONNECT_CHECK_MS = 300_000; // 5 min
     private static final long STALE_DATA_THRESHOLD_MS = 300_000; // 5 minutes (OkHttp handles ping/pong automatically)
     private static final long MAX_CONNECTION_LIFETIME_MS = 23 * 60 * 60 * 1000L + 55 * 60 * 1000L; // 23h 55min
 
@@ -218,6 +219,11 @@ public abstract class AbstractWebSocketConnector implements ExchangeConnector {
         return subscribedSymbols.size();
     }
 
+    @Override
+    public Set<String> getSubscribedSymbols() {
+        return Set.copyOf(subscribedSymbols);
+    }
+
     protected void handleDisconnect() {
         connected.set(false);
         connecting.set(false);
@@ -231,18 +237,24 @@ public abstract class AbstractWebSocketConnector implements ExchangeConnector {
         }
 
         int attempts = reconnectAttempts.incrementAndGet();
-        if (attempts > MAX_RECONNECT_ATTEMPTS) {
-            log.error("[{}:{}] Max reconnect attempts reached", getExchange(), getMarketType());
-            return;
+        long delay;
+        if (attempts <= MAX_RECONNECT_ATTEMPTS) {
+            delay = Math.min(INITIAL_RECONNECT_DELAY_MS * (1L << (attempts - 1)), MAX_RECONNECT_DELAY_MS);
+        } else {
+            // After exhausting exponential backoff, switch to periodic reconnect every 5 min
+            delay = PERIODIC_RECONNECT_CHECK_MS;
         }
 
-        long delay = Math.min(INITIAL_RECONNECT_DELAY_MS * (1L << (attempts - 1)), MAX_RECONNECT_DELAY_MS);
-        log.info("[{}:{}] Scheduling reconnect in {}ms (attempt {})",
-                getExchange(), getMarketType(), delay, attempts);
+        log.info("[{}:{}] Scheduling reconnect in {}ms (attempt {}{})",
+                getExchange(), getMarketType(), delay, attempts,
+                attempts > MAX_RECONNECT_ATTEMPTS ? ", periodic mode" : "");
 
         reconnectTask = scheduler.schedule(() -> {
             if (connectAndWait(5000) && !subscribedSymbols.isEmpty()) {
                 resubscribeAll();
+            } else if (!connected.get()) {
+                // Connection failed — reschedule
+                scheduleReconnect();
             }
         }, delay, TimeUnit.MILLISECONDS);
     }

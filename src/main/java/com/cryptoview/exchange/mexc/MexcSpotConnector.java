@@ -154,6 +154,11 @@ public class MexcSpotConnector implements ExchangeConnector {
     }
 
     @Override
+    public Set<String> getSubscribedSymbols() {
+        return Set.copyOf(allSubscribedSymbols);
+    }
+
+    @Override
     public String getStatusSummary() {
         long connectedCount = connections.stream().filter(MexcWebSocketConnection::isConnected).count();
         Instant lastMsg = lastMessageTime.get();

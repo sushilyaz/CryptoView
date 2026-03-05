@@ -6,9 +6,11 @@ import com.cryptoview.service.volume.VolumeTracker;
 import com.cryptoview.service.workspace.WorkspaceService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
+import java.util.List;
 import java.util.Map;
 
 @RestController
@@ -32,5 +34,10 @@ public class StatusController {
                 Map.entry("volumeTrackingReady", volumeTracker.isVolumeDataReady()),
                 Map.entry("appUptimeSeconds", volumeTracker.getUptimeSeconds())
         );
+    }
+
+    @GetMapping("/symbol/{baseTicker}/markets")
+    public List<String> getMarketsForSymbol(@PathVariable String baseTicker) {
+        return exchangeManager.getMarketsForSymbol(baseTicker);
     }
 }

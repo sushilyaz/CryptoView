@@ -8,7 +8,8 @@ public enum Exchange {
     GATE("Gate"),
     MEXC("MEXC"),
     HYPERLIQUID("Hyperliquid"),
-    LIGHTER("Lighter");
+    LIGHTER("Lighter"),
+    ASTER("Aster");
 
     private final String displayName;
 

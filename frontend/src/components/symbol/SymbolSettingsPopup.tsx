@@ -1,10 +1,8 @@
-import { useState, useEffect, useMemo } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { Modal } from '../common/Modal'
 import { useWorkspaceStore } from '../../stores/workspaceStore'
 import { useUiStore } from '../../stores/uiStore'
-import { useDensityStore } from '../../stores/densityStore'
-import { symbolApi } from '../../api/httpClient'
-import { getBaseTicker } from '../../utils/formatters'
+import { symbolApi, statusApi } from '../../api/httpClient'
 import { EXCHANGE_LABELS } from '../../utils/constants'
 
 export function SymbolSettingsPopup() {
@@ -14,78 +12,68 @@ export function SymbolSettingsPopup() {
   const activeWorkspace = useWorkspaceStore(s => s.activeWorkspace)
   const update = useWorkspaceStore(s => s.update)
   const updateActiveLocal = useWorkspaceStore(s => s.updateActiveLocal)
-  const densities = useDensityStore(s => s.densities)
 
   const [comment, setComment] = useState('')
   const [minDensity, setMinDensity] = useState('')
   const [marketOverrides, setMarketOverrides] = useState<Record<string, string>>({})
   const [saving, setSaving] = useState(false)
+  const [availableMarkets, setAvailableMarkets] = useState<string[]>([])
+  const [loading, setLoading] = useState(false)
 
-  // Определяем доступные биржи/рынки для этого тикера из текущих densities
-  const availableMarkets = useMemo(() => {
-    if (!symbol) return []
-    const markets = new Set<string>()
-    for (const d of densities) {
-      if (getBaseTicker(d.symbol) === symbol) {
-        markets.add(`${d.exchange}_${d.marketType}`)
-      }
-    }
-    return [...markets].sort()
-  }, [symbol, densities])
+  // Снапшот workspace при открытии — чтобы обновления densities не сбрасывали инпуты
+  const snapshotRef = useRef(activeWorkspace)
 
+  // При открытии модалки: загрузить биржи из бэкенда + снапшотить workspace
   useEffect(() => {
-    if (symbol && activeWorkspace) {
-      // Комментарий хранится по базовому тикеру
-      setComment(activeWorkspace.symbolComments[symbol] ?? '')
+    if (!symbol || !activeWorkspace) return
 
-      // Глобальный per-symbol override (по первому raw symbol)
-      const firstRaw = rawSymbols[0]?.toUpperCase() ?? symbol.toUpperCase()
-      const override = activeWorkspace.symbolMinDensityOverrides[firstRaw]
-      setMinDensity(override != null ? String(override) : '')
+    // Снапшотим workspace один раз при открытии
+    snapshotRef.current = activeWorkspace
 
-      // Per-market overrides: ключ "ETHUSDT_BINANCE_SPOT"
-      const overrides: Record<string, string> = {}
-      for (const marketKey of availableMarkets) {
-        // Ищем raw symbol для этого market
-        const rawSym = findRawSymbolForMarket(marketKey)
-        if (rawSym) {
+    // Инициализируем инпуты из снапшота
+    setComment(activeWorkspace.symbolComments[symbol] ?? '')
+    const firstRaw = rawSymbols[0]?.toUpperCase() ?? symbol.toUpperCase()
+    const override = activeWorkspace.symbolMinDensityOverrides[firstRaw]
+    setMinDensity(override != null ? String(override) : '')
+
+    // Загружаем доступные биржи из API
+    setLoading(true)
+    statusApi.getMarketsForSymbol(symbol)
+      .then(markets => {
+        setAvailableMarkets(markets.sort())
+        // Инициализируем market overrides после получения бирж
+        const overrides: Record<string, string> = {}
+        for (const marketKey of markets) {
+          const rawSym = findRawForMarket(marketKey, rawSymbols, symbol)
           const key = `${rawSym}_${marketKey}`
           const val = activeWorkspace.symbolMarketMinDensityOverrides[key]
           overrides[marketKey] = val != null ? String(val) : ''
         }
-      }
-      setMarketOverrides(overrides)
-    }
-  }, [symbol, activeWorkspace, availableMarkets])
-
-  // Найти raw symbol для конкретного market key (BINANCE_SPOT -> ETHUSDT)
-  function findRawSymbolForMarket(marketKey: string): string | undefined {
-    const [exchange, marketType] = marketKey.split('_')
-    for (const d of densities) {
-      if (getBaseTicker(d.symbol) === symbol && d.exchange === exchange && d.marketType === marketType) {
-        return d.symbol.toUpperCase()
-      }
-    }
-    return rawSymbols[0]?.toUpperCase()
-  }
+        setMarketOverrides(overrides)
+      })
+      .catch(() => setAvailableMarkets([]))
+      .finally(() => setLoading(false))
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [symbol]) // Только при смене символа (открытии модалки)
 
   if (!symbol) return null
 
   const handleSave = async () => {
-    if (!activeWorkspace) return
+    const ws = snapshotRef.current
+    if (!ws) return
     setSaving(true)
     try {
       const firstRaw = rawSymbols[0]?.toUpperCase() ?? symbol.toUpperCase()
 
       // 1. Комментарий (по базовому тикеру)
       if (comment.trim()) {
-        await symbolApi.setComment(activeWorkspace.id, symbol, comment.trim())
+        await symbolApi.setComment(ws.id, symbol, comment.trim())
         updateActiveLocal({
-          symbolComments: { ...activeWorkspace.symbolComments, [symbol]: comment.trim() },
+          symbolComments: { ...ws.symbolComments, [symbol]: comment.trim() },
         })
       } else {
-        await symbolApi.deleteComment(activeWorkspace.id, symbol)
-        const comments = { ...activeWorkspace.symbolComments }
+        await symbolApi.deleteComment(ws.id, symbol)
+        const comments = { ...ws.symbolComments }
         delete comments[symbol]
         updateActiveLocal({ symbolComments: comments })
       }
@@ -93,22 +81,21 @@ export function SymbolSettingsPopup() {
       // 2. Глобальный per-symbol min density (по raw symbol)
       const num = parseInt(minDensity)
       if (!isNaN(num) && minDensity.trim()) {
-        await symbolApi.setMinDensity(activeWorkspace.id, firstRaw, num)
+        await symbolApi.setMinDensity(ws.id, firstRaw, num)
         updateActiveLocal({
-          symbolMinDensityOverrides: { ...activeWorkspace.symbolMinDensityOverrides, [firstRaw]: num },
+          symbolMinDensityOverrides: { ...ws.symbolMinDensityOverrides, [firstRaw]: num },
         })
       } else {
-        await symbolApi.deleteMinDensity(activeWorkspace.id, firstRaw)
-        const overrides = { ...activeWorkspace.symbolMinDensityOverrides }
+        await symbolApi.deleteMinDensity(ws.id, firstRaw)
+        const overrides = { ...ws.symbolMinDensityOverrides }
         delete overrides[firstRaw]
         updateActiveLocal({ symbolMinDensityOverrides: overrides })
       }
 
       // 3. Per-market overrides — через PUT workspace
-      const newSymbolMarketOverrides = { ...activeWorkspace.symbolMarketMinDensityOverrides }
+      const newSymbolMarketOverrides = { ...ws.symbolMarketMinDensityOverrides }
       for (const marketKey of availableMarkets) {
-        const rawSym = findRawSymbolForMarket(marketKey)
-        if (!rawSym) continue
+        const rawSym = findRawForMarket(marketKey, rawSymbols, symbol)
         const compositeKey = `${rawSym}_${marketKey}`
         const val = parseInt(marketOverrides[marketKey] ?? '')
         if (!isNaN(val) && (marketOverrides[marketKey] ?? '').trim()) {
@@ -118,8 +105,8 @@ export function SymbolSettingsPopup() {
         }
       }
       updateActiveLocal({ symbolMarketMinDensityOverrides: newSymbolMarketOverrides })
-      await update(activeWorkspace.id, {
-        ...activeWorkspace,
+      await update(ws.id, {
+        ...ws,
         symbolMarketMinDensityOverrides: newSymbolMarketOverrides,
       })
 
@@ -127,12 +114,6 @@ export function SymbolSettingsPopup() {
     } finally {
       setSaving(false)
     }
-  }
-
-  function formatMarketLabel(marketKey: string): string {
-    const [exchange, marketType] = marketKey.split('_')
-    const label = EXCHANGE_LABELS[exchange as keyof typeof EXCHANGE_LABELS] ?? exchange
-    return `${label} ${marketType === 'FUTURES' ? 'Fut' : 'Spot'}`
   }
 
   return (
@@ -166,7 +147,9 @@ export function SymbolSettingsPopup() {
           <p className="text-xs text-gray-600 mt-1">Общий порог для всех бирж. Оставьте пустым для настроек workspace.</p>
         </div>
 
-        {availableMarkets.length > 0 && (
+        {loading ? (
+          <div className="text-xs text-gray-500">Загрузка бирж...</div>
+        ) : availableMarkets.length > 0 && (
           <div>
             <label className="block text-sm text-gray-400 mb-2">Мин. размер по биржам ($)</label>
             <div className="space-y-2">
@@ -205,4 +188,22 @@ export function SymbolSettingsPopup() {
       </div>
     </Modal>
   )
+}
+
+// Определяет raw symbol для данного market key (например BINANCE_FUTURES -> ETHUSDT)
+function findRawForMarket(marketKey: string, rawSymbols: string[], baseTicker: string): string {
+  const [, marketType] = marketKey.split('_')
+  // Hyperliquid Futures использует базовый тикер без суффикса
+  if (marketKey.startsWith('HYPERLIQUID')) return baseTicker.toUpperCase()
+  // CEX: обычно USDT для futures/spot
+  const suffix = marketType === 'FUTURES' ? 'USDT' : 'USDT'
+  const candidate = baseTicker.toUpperCase() + suffix
+  if (rawSymbols.map(s => s.toUpperCase()).includes(candidate)) return candidate
+  return rawSymbols[0]?.toUpperCase() ?? baseTicker.toUpperCase() + 'USDT'
+}
+
+function formatMarketLabel(marketKey: string): string {
+  const [exchange, marketType] = marketKey.split('_')
+  const label = EXCHANGE_LABELS[exchange as keyof typeof EXCHANGE_LABELS] ?? exchange
+  return `${label} ${marketType === 'FUTURES' ? 'Fut' : 'Spot'}`
 }

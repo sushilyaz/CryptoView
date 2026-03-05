@@ -89,7 +89,19 @@ cryptoview:
         min-density-usd: 400000
 
     LIGHTER:
-      enabled: false
+      enabled: true
+      # Lighter has only perp markets, no spot
       spot:
         enabled: false
+      futures:
+        enabled: true
+        min-density-usd: 400000
+
+    ASTER:
+      enabled: true
+      spot:
+        enabled: true
+        min-density-usd: 400000
+      futures:
+        enabled: true
         min-density-usd: 400000
